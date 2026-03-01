@@ -103,8 +103,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--min-confidence", "-mc",
         type=float,
-        default=30.0,
-        help="Confianza mínima para incluir palabras (0-100, default: 30).",
+        default=10.0,
+        help="Confianza mínima para incluir palabras (0-100, default: 10).",
     )
 
     # PSM (Page Segmentation Mode)

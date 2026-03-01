@@ -93,6 +93,11 @@ python main.py --image foto_clara.png --output txt --no-preprocess
 python main.py --image baja_calidad.jpg --output txt --min-confidence 20
 ```
 
+### Interfaz gráfica
+```bash
+python gui.py
+```
+
 ---
 
 ## Argumentos CLI
@@ -116,6 +121,7 @@ python main.py --image baja_calidad.jpg --output txt --min-confidence 20
 ```
 ImageRD/
 ├── main.py                   # Punto de entrada CLI
+├── gui.py                    # Interfaz gráfica (CustomTkinter)
 ├── ocr_engine.py             # Motor OCR con Tesseract
 ├── image_processing.py       # Preprocesamiento de imágenes
 ├── layout_reconstructor.py   # Reconstrucción de estructura visual

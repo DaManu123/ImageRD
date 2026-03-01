@@ -9,7 +9,7 @@ visual original del documento.
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
-from ocr_engine import BlockData, LineData, OCRResult
+from ocr_engine import BlockData, LineData, OCRResult, _post_process_document
 from utils import logger
 
 
@@ -99,6 +99,10 @@ class LayoutReconstructor:
 
         # Paso 3: Reconstruir texto con formato
         formatted_text = self._format_text(ordered_blocks, ocr_result.image_width)
+
+        # Paso 4: Post-procesamiento a nivel de documento
+        #         (detecta exámenes, agrega ○ a opciones, separadores, etc.)
+        formatted_text = _post_process_document(formatted_text)
 
         doc = ReconstructedDocument(
             columns=columns,

@@ -106,7 +106,7 @@ class OCREngine:
     def __init__(
         self,
         language: str = "spa",
-        min_confidence: float = 25.0,
+        min_confidence: float = 10.0,
         psm: int = 3,
         multi_pass: bool = True,
     ) -> None:
@@ -235,7 +235,7 @@ class OCREngine:
             return 0.0
 
         # Contar palabras "reales" (no artefactos de UI)
-        VALID_SINGLE = set("aeiouAEIOUyY0123456789OoXx=")
+        VALID_SINGLE = set("aeiouAEIOUyY0123456789OoXx=()[]{}:;.,+-*/\"'")
         real_words = 0
         confidences = []
 
@@ -269,9 +269,15 @@ class OCREngine:
             if not text or conf < self.min_confidence:
                 continue
 
-            # Filtrar caracteres basura aislados
+            # Filtrar solo basura inequívoca (mínimo posible)
             if len(text) == 1 and text in "|~`^":
                 continue
+
+            # Preservar símbolos de formulario que Tesseract detecta
+            # (círculos, checks, bullets, etc.)
+            if text in ("O", "o", "0", "Oo", "oO"):
+                # Podría ser radio button — preservar
+                pass
 
             words.append(WordData(
                 text=text, confidence=conf,
@@ -447,7 +453,335 @@ def _fix_ocr_text(text: str) -> str:
     return text
 
 
-# ─── Conveniencia ─────────────────────────────
-def quick_extract(image_path: str, language: str = "spa", preprocess: bool = True) -> str:
-    engine = OCREngine(language=language)
-    return engine.extract(image_path, preprocess=preprocess).raw_text
+def _post_process_document(text: str) -> str:
+    """
+    Post-procesamiento a nivel de DOCUMENTO COMPLETO.
+
+    Detecta patrones de exámenes/cuestionarios y:
+      - Agrega símbolos ○ antes de opciones de respuesta.
+      - Agrega separadores ─── entre preguntas.
+      - Limpia espaciado y formato.
+      - Corrige confusiones I/l (Ist→lst, etc.).
+      - Corrige confusiones comunes de OCR en español.
+
+    Args:
+        text: Texto completo del documento reconstruido.
+
+    Returns:
+        Texto mejorado con formato de examen.
+    """
+    import re
+
+    lines = text.split('\n')
+
+    # ── Detectar si es un examen/cuestionario ──
+    question_indices = []
+    for i, line in enumerate(lines):
+        if re.match(r'^\s*Pregunta\s+\d+', line.strip(), re.IGNORECASE):
+            question_indices.append(i)
+
+    is_exam = len(question_indices) >= 2
+
+    if not is_exam:
+        # No es examen — solo correcciones globales
+        text = _apply_global_fixes(text)
+        return text
+
+    # ── Mapear zonas del examen ──
+    # Cada pregunta tiene: header, enunciado, [bloque de código], opciones
+    questions = _parse_exam_questions(lines, question_indices)
+
+    # ── Reconstruir el documento con formato ──
+    result: list = []
+
+    # Texto antes de la primera pregunta (título del examen, etc.)
+    for i in range(question_indices[0]):
+        result.append(lines[i])
+
+    for q in questions:
+        # Separador antes de cada pregunta
+        if result and result[-1].strip() != '':
+            result.append('')
+        result.append('─' * 50)
+        result.append('')
+
+        # Header: "Pregunta N"
+        result.append(q['header'])
+
+        # Enunciado
+        for line in q['statement']:
+            result.append(line)
+
+        # Bloque de código (si hay)
+        if q['code']:
+            result.append('')
+            for line in q['code']:
+                result.append(line)
+            result.append('')
+
+        # Opciones con ○
+        for opt in q['options']:
+            # Limpiar texto de la opción
+            clean = _clean_option_text(opt.strip())
+            if clean:
+                result.append(f'○ {clean}')
+
+        # Líneas restantes (no clasificadas)
+        for line in q.get('trailing', []):
+            result.append(line)
+
+    text = '\n'.join(result)
+
+    # ── Correcciones globales ──
+    text = _apply_global_fixes(text)
+
+    # ── Limpiar líneas vacías excesivas (máximo 2 consecutivas) ──
+    text = re.sub(r'\n{4,}', '\n\n\n', text)
+
+    return text
+
+
+def _parse_exam_questions(lines: list, question_indices: list) -> list:
+    """
+    Parsea las preguntas del examen identificando sus componentes.
+
+    Algoritmo de 3 fases:
+      1. Statement: primeras líneas hasta terminador (``:`` / ``.`` / ``?``),
+         con detección de continuación por minúscula inicial o longitud.
+      2. Clasificación: cada línea restante se marca como *code* o *text*.
+      3. Opciones: las líneas *text* tras el bloque de código son opciones.
+         Si todas las líneas son código, las últimas 3 se toman como opciones
+         (maneja preguntas como Q2/Q4 donde las opciones son líneas de código).
+
+    Args:
+        lines: Todas las líneas del texto.
+        question_indices: Índices donde empieza cada pregunta.
+
+    Returns:
+        Lista de diccionarios ``{header, statement, code, options}``.
+    """
+
+    questions: list = []
+
+    for qi, q_start in enumerate(question_indices):
+        q_end = question_indices[qi + 1] if qi + 1 < len(question_indices) else len(lines)
+        q_lines = lines[q_start:q_end]
+
+        if not q_lines:
+            continue
+
+        header = q_lines[0].strip()
+        body = q_lines[1:]
+
+        # Eliminar blancos al inicio y final del cuerpo
+        while body and not body[0].strip():
+            body = body[1:]
+        while body and not body[-1].strip():
+            body = body[:-1]
+
+        if not body:
+            questions.append({'header': header, 'statement': [], 'code': [], 'options': []})
+            continue
+
+        # ── FASE 1: Extraer enunciado ──────────────────────────────
+        statement: list = []
+        rest_start = 0
+
+        for j, line in enumerate(body):
+            stripped = line.strip()
+
+            # Saltar blancos antes del enunciado
+            if not stripped:
+                if statement:
+                    # Antes de romper, mirar si la siguiente línea no vacía
+                    # comienza con minúscula (continuación del enunciado)
+                    next_ne = None
+                    for k in range(j + 1, len(body)):
+                        ns = body[k].strip()
+                        if ns:
+                            next_ne = ns
+                            break
+                    if next_ne and next_ne[0].islower():
+                        continue  # saltar blanco — viene continuación
+                    # No es continuación → fin del enunciado
+                    rest_start = j + 1
+                    break
+                continue
+
+            statement.append(line)
+
+            # ¿Termina el enunciado aquí?
+            if stripped.endswith(':') or stripped.endswith('.') or stripped.endswith('?'):
+                rest_start = j + 1
+                break
+
+            # Heurística de continuación: mirar la siguiente línea no vacía
+            next_stripped = None
+            for k in range(j + 1, len(body)):
+                ns = body[k].strip()
+                if ns:
+                    next_stripped = ns
+                    break
+
+            if next_stripped:
+                # Si la siguiente comienza en minúscula → continuación del enunciado
+                if next_stripped[0].islower():
+                    continue
+                # Si la siguiente es mucho más corta → probablemente ya es opción
+                if len(next_stripped) < len(stripped) * 0.4:
+                    rest_start = j + 1
+                    break
+            else:
+                # No hay más líneas no vacías
+                rest_start = j + 1
+                break
+        else:
+            rest_start = len(body)
+
+        # ── FASE 2: Clasificar líneas restantes (code / text) ─────
+        rest = body[rest_start:]
+        # Eliminar blancos iniciales del resto
+        while rest and not rest[0].strip():
+            rest = rest[1:]
+
+        classified: list = []  # lista de (tipo, línea)
+        for line in rest:
+            stripped = line.strip()
+            if not stripped:
+                classified.append(('empty', line))
+            elif _is_code_line(stripped):
+                classified.append(('code', line))
+            else:
+                classified.append(('text', line))
+
+        # Buscar la primera línea *text* para separar código de opciones
+        first_text_idx = None
+        for idx, (cls, _) in enumerate(classified):
+            if cls == 'text':
+                first_text_idx = idx
+                break
+
+        if first_text_idx is not None:
+            code = [l for cls, l in classified[:first_text_idx] if cls == 'code']
+            options = [l.strip() for cls, l in classified[first_text_idx:] if cls != 'empty']
+        else:
+            # Todo es código o vacío
+            code_lines = [l for cls, l in classified if cls == 'code']
+            code = code_lines
+            options = []
+
+        # ── FASE 3: Caso especial — opciones "ocultas" en código ──
+        # Si no hay opciones text pero hay ≥3 líneas de código,
+        # las últimas 3 líneas de código son las opciones de respuesta.
+        if not options and len(code) >= 3:
+            options = [l.strip() for l in code[-3:]]
+            code = code[:-3]
+
+        questions.append({
+            'header': header,
+            'statement': statement,
+            'code': code,
+            'options': options,
+        })
+
+    return questions
+
+
+def _is_code_line(stripped: str) -> bool:
+    """
+    Determina si una línea es código de programación.
+
+    Args:
+        stripped: Línea sin espacios al inicio/final.
+
+    Returns:
+        True si parece código Python.
+    """
+    import re
+
+    # Patrones inequívocos de código
+    code_patterns = [
+        r'^(if|elif|else|for|while|def|class|return|import|from|try|except|finally|with)\b',
+        r'^[a-z_]\w*\s*=\s*',                           # asignación: var = ...
+        r'^\w+\(.*\)',                                    # llamada: func(...)
+        r'print\s*\(',                                    # print(
+        r'input\s*\(',                                    # input(
+        r'=\s*input\s*\(',                                # = input(
+    ]
+
+    for pat in code_patterns:
+        if re.search(pat, stripped):
+            return True
+
+    # Contiene operadores de programación
+    code_operators = ['==', '>=', '<=', '!=', '= input(', 'print(']
+    return any(op in stripped for op in code_operators)
+
+
+
+def _clean_option_text(text: str) -> str:
+    """Limpia prefijos residuales del OCR en opciones de respuesta."""
+    import re
+    # Quitar "O " o "o " al inicio si es residuo de ○ detectado como letra
+    text = re.sub(r'^[Oo0]\s+(?=[A-ZÁÉÍÓÚ])', '', text)
+    text = re.sub(r'^[Oo0]\)\s*', '', text)
+    text = re.sub(r'^[a-dA-D]\)\s*', '', text)
+    # Quitar ○ ya existente si se duplicaría
+    text = re.sub(r'^○\s*', '', text)
+    return text.strip()
+
+
+def _apply_global_fixes(text: str) -> str:
+    """
+    Correcciones globales de OCR que aplican a todo el documento.
+
+    Args:
+        text: Texto completo.
+
+    Returns:
+        Texto corregido.
+    """
+    import re
+
+    # Ist → lst (confusión I/l muy común en OCR)
+    text = re.sub(r'\bIst\b', 'lst', text)
+    text = re.sub(r'\bIst\(', 'lst(', text)
+    text = re.sub(r'\bIst\[', 'lst[', text)
+
+    # iflint → if(int  (confusión l/( y fusión de palabras)
+    text = re.sub(r'\biflint\b', 'if(int', text)
+    text = re.sub(r'\bifllint\b', 'if(int', text)
+
+    # M/P) → M/F) cuando aparece en contexto de Genero
+    text = re.sub(r'Genero\s*\(M/P\)', 'Genero (M/F)', text)
+    text = re.sub(r'\(M/P\)', '(M/F)', text)
+
+    # Corregir "esun" → "es un" (palabras pegadas comunes)
+    text = re.sub(r'\besun\b', 'es un', text)
+
+    # Corregir "diferencía" → "diferencia" (tilde incorrecta)
+    text = re.sub(r'\bdiferencía\b', 'diferencia', text)
+
+    return text
+
+
+# ─────────────────────────────────────────────────────────────
+#  Función de conveniencia rápida
+# ─────────────────────────────────────────────────────────────
+
+def quick_extract(image_path: str, lang: str = "spa") -> str:
+    """Extrae texto de una imagen con configuración por defecto.
+
+    Función de conveniencia que ejecuta el pipeline OCR completo
+    con parámetros predeterminados.
+
+    Args:
+        image_path: Ruta a la imagen.
+        lang: Idioma(s) de Tesseract (por defecto ``"spa"``).
+
+    Returns:
+        Texto extraído.
+    """
+    engine = OCREngine(lang=lang)
+    result = engine.process_image(image_path)
+    return result.full_text

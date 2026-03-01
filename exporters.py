@@ -62,7 +62,7 @@ def export_to_txt(
     content = _build_txt_content(ocr_result, reconstructed)
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8")
+    path.write_text(content, encoding="utf-8-sig")
 
     logger.info("Archivo TXT generado correctamente (%d bytes).", path.stat().st_size)
     return path

@@ -15,5 +15,8 @@ numpy>=1.24.0
 # Generación de documentos
 python-docx>=0.8.11
 
+# Interfaz gráfica
+customtkinter>=5.2.0
+
 # (Opcional) Generación de PDF
 # reportlab>=4.0
