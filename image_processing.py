@@ -29,7 +29,7 @@ from utils import logger
 # ─────────────────────────────────────────────
 # Constantes
 # ─────────────────────────────────────────────
-BORDER_PADDING = 40          # px — margen blanco
+BORDER_PADDING = 80          # px — margen blanco (mayor para evitar recorte)
 MIN_UPSCALE_FACTOR = 2.0     # Siempre escalar al menos 2x
 MAX_UPSCALE_FACTOR = 4.0     # No escalar más de 4x
 
@@ -447,3 +447,94 @@ def smart_load(image_path: str) -> np.ndarray:
 def resize_if_needed(image: np.ndarray, min_height: int = 600, max_height: int = 8000) -> np.ndarray:
     """Compatibilidad — ya no se usa en pipeline principal."""
     return image
+
+
+# ─────────────────────────────────────────────
+# Auto-detección de PSM óptimo
+# ─────────────────────────────────────────────
+def analyze_optimal_psm(image_path: str) -> List[int]:
+    """
+    Analiza la estructura visual de la imagen para ordenar los PSMs
+    de más a menos probable.
+
+    Análisis:
+      - Aspecto ratio: imágenes altas y estrechas → PSM 4 (columna).
+      - Densidad de texto: mucho texto → PSM 6 (bloque uniforme).
+      - Líneas horizontales: separadores → PSM 3 (auto).
+      - Texto disperso: pocos bloques → PSM 11 (sparse).
+
+    Args:
+        image_path: Ruta a la imagen.
+
+    Returns:
+        Lista de PSMs ordenados de mejor a peor.
+    """
+    img = smart_load(image_path)
+    gray = _to_gray(img)
+    h, w = gray.shape[:2]
+    aspect = h / max(w, 1)
+
+    # Reducción para análisis rápido
+    small = cv2.resize(gray, (min(w, 600), min(h, 600)), interpolation=cv2.INTER_AREA)
+    sh, sw = small.shape[:2]
+
+    # 1. Detectar líneas horizontales (bordes/separadores)
+    edges = cv2.Canny(small, 50, 150)
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, 80,
+                            minLineLength=sw // 3, maxLineGap=10)
+    h_lines = 0
+    if lines is not None:
+        for [[x1, y1, x2, y2]] in lines:
+            angle = abs(math.degrees(math.atan2(y2 - y1, x2 - x1)))
+            if angle < 5:  # casi horizontal
+                h_lines += 1
+
+    # 2. Densidad de píxeles oscuros (texto)
+    _, bw = cv2.threshold(small, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    text_density = np.sum(bw > 0) / (sh * sw)
+
+    # 3. Contornos para contar bloques de texto
+    contours, _ = cv2.findContours(bw, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # Filtrar contornos pequeños
+    big_contours = [c for c in contours if cv2.contourArea(c) > (sh * sw * 0.0005)]
+    n_blocks = len(big_contours)
+
+    logger.info("Análisis PSM — aspect: %.2f, h_lines: %d, density: %.3f, blocks: %d",
+                 aspect, h_lines, text_density, n_blocks)
+
+    # Clasificación basada en características
+    scores = {3: 0, 6: 0, 4: 0}
+
+    # Imagen muy alta (exámenes, formularios) → PSM 6 es ideal
+    if aspect > 2.0:
+        scores[6] += 3
+        scores[4] += 1
+    elif aspect > 1.0:
+        scores[6] += 2
+    else:
+        scores[3] += 2  # Imágenes anchas: auto funciona bien
+
+    # Muchos separadores horizontales (exámenes)
+    if h_lines >= 5:
+        scores[6] += 2
+        scores[3] += 1
+
+    # Alta densidad de texto
+    if text_density > 0.15:
+        scores[6] += 2
+    elif text_density > 0.08:
+        scores[6] += 1
+        scores[3] += 1
+
+    # Muchos bloques de texto
+    if n_blocks > 20:
+        scores[6] += 1
+    elif n_blocks < 5:
+        scores[3] += 1
+
+    # Ordenar PSMs por score
+    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    result = [psm for psm, _ in ranked]
+
+    logger.info("PSM ranking: %s", result)
+    return result

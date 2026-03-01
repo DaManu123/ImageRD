@@ -103,8 +103,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--min-confidence", "-mc",
         type=float,
-        default=10.0,
-        help="Confianza mínima para incluir palabras (0-100, default: 10).",
+        default=5.0,
+        help="Confianza mínima para incluir palabras (0-100, default: 5).",
     )
 
     # PSM (Page Segmentation Mode)
@@ -165,7 +165,7 @@ def run_pipeline(
     output_format: str = "txt",
     language: str = "spa",
     output_path: Optional[str] = None,
-    min_confidence: float = 30.0,
+    min_confidence: float = 5.0,
     psm: int = 3,
     preprocess: bool = True,
     multi_pass: bool = True,
@@ -220,6 +220,7 @@ def run_pipeline(
         psm=psm,
         multi_pass=multi_pass,
         workers=workers,
+        auto_psm=True,
     )
     ocr_result: OCRResult = engine.extract(
         str(validated_path),

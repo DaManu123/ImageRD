@@ -265,22 +265,6 @@ class ImageRDApp(ctk.CTk):
             height=32, font=ctk.CTkFont(size=13),
         ).grid(row=r, column=0, padx=20, pady=(4, 16), sticky="ew"); r += 1
 
-        # ── CONFIANZA MÍNIMA ──
-        r = self._section_header(r, "CONFIANZA MÍNIMA")
-
-        self._conf_label = ctk.CTkLabel(
-            self.sidebar, text="10 %",
-            font=ctk.CTkFont(size=22, weight="bold"),
-        )
-        self._conf_label.grid(row=r, column=0, padx=20, pady=(0, 0)); r += 1
-
-        self._conf_slider = ctk.CTkSlider(
-            self.sidebar, from_=0, to=100, number_of_steps=100,
-            command=self._on_confidence_change,
-        )
-        self._conf_slider.set(10)
-        self._conf_slider.grid(row=r, column=0, padx=20, pady=(0, 16), sticky="ew"); r += 1
-
         # ── OPCIONES ──
         r = self._section_header(r, "OPCIONES")
 
@@ -292,19 +276,11 @@ class ImageRDApp(ctk.CTk):
         self._multipass_var = ctk.BooleanVar(value=True)
         r = self._switch_row(r, "Multi-paso (más preciso)", self._multipass_var)
 
-        # Selector PSM
+        # Info: PSM se auto-detecta
         ctk.CTkLabel(
-            self.sidebar, text="Segmentación de página:",
+            self.sidebar, text="PSM: auto-detección inteligente ✓",
             font=ctk.CTkFont(size=11), text_color="gray",
-        ).grid(row=r, column=0, padx=20, pady=(8, 2), sticky="w"); r += 1
-
-        self._psm_var = ctk.StringVar(value="3 — Automático (recomendado)")
-        ctk.CTkOptionMenu(
-            self.sidebar,
-            values=list(PSM_MODES.keys()),
-            variable=self._psm_var,
-            height=30, font=ctk.CTkFont(size=11),
-        ).grid(row=r, column=0, padx=20, pady=(0, 12), sticky="ew"); r += 1
+        ).grid(row=r, column=0, padx=20, pady=(8, 12), sticky="w"); r += 1
 
         # Workers (paralelismo)
         import os as _os
@@ -561,10 +537,6 @@ class ImageRDApp(ctk.CTk):
         except (ValueError, IndexError):
             self._workers_var.set(0)
 
-    def _on_confidence_change(self, value):
-        """Actualiza el label cuando el slider de confianza cambia."""
-        self._conf_label.configure(text=f"{int(value)} %")
-
     def _toggle_theme(self):
         """Alterna entre modo oscuro y claro."""
         if ctk.get_appearance_mode() == "Dark":
@@ -621,8 +593,8 @@ class ImageRDApp(ctk.CTk):
             image_path=self._image_path,
             output_format=self._format_var.get(),
             language=language,
-            min_confidence=self._conf_slider.get(),
-            psm=PSM_MODES.get(self._psm_var.get(), 3),
+            min_confidence=5.0,
+            psm=3,
             preprocess=self._preproc_var.get(),
             multi_pass=self._multipass_var.get(),
             workers=self._workers_var.get(),
@@ -653,6 +625,7 @@ class ImageRDApp(ctk.CTk):
                 psm=params["psm"],
                 multi_pass=params["multi_pass"],
                 workers=params["workers"],
+                auto_psm=True,
             )
             ocr_result: OCRResult = engine.extract(
                 params["image_path"],
@@ -679,13 +652,42 @@ class ImageRDApp(ctk.CTk):
             )
 
             # Paso 3 — Exportación
+            # Forzar guardado en resultados/ del directorio del proyecto
             self.after(0, self._update_status, "Exportando resultados…")
-            generated: List[Path] = export_all(
-                ocr_result=ocr_result,
-                reconstructed=reconstructed,
-                output_format=params["output_format"],
-                input_path=params["image_path"],
-            )
+            _project_results = Path(__file__).resolve().parent / "resultados"
+            _project_results.mkdir(parents=True, exist_ok=True)
+
+            from utils import generate_output_path
+
+            fmt = params["output_format"]
+            if fmt == "all":
+                # Para cada formato, generar ruta en resultados/ del proyecto
+                generated: List[Path] = []
+                for sub_fmt in ("txt", "json", "docx"):
+                    _out = generate_output_path(
+                        Path(params["image_path"]), sub_fmt,
+                        output_dir=str(_project_results),
+                    )
+                    sub_files = export_all(
+                        ocr_result=ocr_result,
+                        reconstructed=reconstructed,
+                        output_format=sub_fmt,
+                        input_path=params["image_path"],
+                        output_path=str(_out),
+                    )
+                    generated.extend(sub_files)
+            else:
+                _out_path = generate_output_path(
+                    Path(params["image_path"]), fmt,
+                    output_dir=str(_project_results),
+                )
+                generated = export_all(
+                    ocr_result=ocr_result,
+                    reconstructed=reconstructed,
+                    output_format=fmt,
+                    input_path=params["image_path"],
+                    output_path=str(_out_path),
+                )
 
             elapsed = time.time() - t0
 

@@ -24,6 +24,7 @@ from pytesseract import Output
 from image_processing import (
     preprocess_image,
     generate_preprocessing_variants,
+    analyze_optimal_psm,
     smart_load,
     convert_to_grayscale,
     upscale_for_ocr,
@@ -111,15 +112,17 @@ class OCREngine:
     def __init__(
         self,
         language: str = "spa",
-        min_confidence: float = 10.0,
+        min_confidence: float = 5.0,
         psm: int = 3,
         multi_pass: bool = True,
         workers: int = 0,
+        auto_psm: bool = True,
     ) -> None:
         self.language = parse_languages(language)
         self.min_confidence = min_confidence
         self.psm = psm
         self.multi_pass = multi_pass
+        self.auto_psm = auto_psm
 
         # workers=0 → auto-detectar (núcleos CPU, tope _MAX_WORKERS)
         if workers <= 0:
@@ -166,10 +169,17 @@ class OCREngine:
         """
         variants = generate_preprocessing_variants(image_path)
 
+        # ── Determinar orden de PSMs ──
+        if self.auto_psm:
+            psm_order = analyze_optimal_psm(image_path)
+            logger.info("Auto-PSM: orden optimizado %s", psm_order)
+        else:
+            psm_order = self.CANDIDATE_PSMS
+
         # ── Construir lista de tareas (variant_idx, variant, psm) ──
         tasks: List[Tuple[int, np.ndarray, int]] = []
         for vi, variant in enumerate(variants):
-            for psm in self.CANDIDATE_PSMS:
+            for psm in psm_order:
                 tasks.append((vi, variant, psm))
 
         logger.info("Multi-paso paralelo: %d tareas → %d workers",
@@ -645,16 +655,27 @@ def _parse_exam_questions(lines: list, question_indices: list) -> list:
             # Saltar blancos antes del enunciado
             if not stripped:
                 if statement:
-                    # Antes de romper, mirar si la siguiente línea no vacía
-                    # comienza con minúscula (continuación del enunciado)
+                    # Buscar siguiente línea no vacía
                     next_ne = None
                     for k in range(j + 1, len(body)):
                         ns = body[k].strip()
                         if ns:
                             next_ne = ns
                             break
+                    # Señal 1: minúscula inicial → continuación segura
                     if next_ne and next_ne[0].islower():
                         continue  # saltar blanco — viene continuación
+                    # Señal 2: enunciado sin puntuación terminal
+                    # + siguiente línea con ≥2 palabras → wrap probable
+                    # (cubre "De instrucciones.", "Consola: 2345...")
+                    last_stmt = statement[-1].strip()
+                    stmt_incomplete = not (
+                        last_stmt.endswith(':')
+                        or last_stmt.endswith('.')
+                        or last_stmt.endswith('?')
+                    )
+                    if stmt_incomplete and next_ne and len(next_ne.split()) >= 2:
+                        continue
                     # No es continuación → fin del enunciado
                     rest_start = j + 1
                     break
@@ -679,6 +700,11 @@ def _parse_exam_questions(lines: list, question_indices: list) -> list:
                 # Si la siguiente comienza en minúscula → continuación del enunciado
                 if next_stripped[0].islower():
                     continue
+                # Si el enunciado no tiene puntuación terminal y la
+                # siguiente línea tiene ≥2 palabras → wrap probable
+                if not (stripped.endswith(':') or stripped.endswith('.') or stripped.endswith('?')):
+                    if len(next_stripped.split()) >= 2:
+                        continue
                 # Si la siguiente es mucho más corta → probablemente ya es opción
                 if len(next_stripped) < len(stripped) * 0.4:
                     rest_start = j + 1
