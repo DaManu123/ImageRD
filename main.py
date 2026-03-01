@@ -130,6 +130,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Desactivar estrategia multi-paso (más rápido, menos preciso).",
     )
 
+    # Workers (paralelismo)
+    parser.add_argument(
+        "--workers", "-w",
+        type=int, default=0,
+        help=(
+            "Número de hilos para procesamiento paralelo. "
+            "0 = auto-detectar según núcleos CPU (por defecto)."
+        ),
+    )
+
     # Verbosidad
     parser.add_argument(
         "--verbose", "-v",
@@ -159,6 +169,7 @@ def run_pipeline(
     psm: int = 3,
     preprocess: bool = True,
     multi_pass: bool = True,
+    workers: int = 0,
 ) -> List[Path]:
     """
     Ejecuta el pipeline completo de extracción OCR.
@@ -208,6 +219,7 @@ def run_pipeline(
         min_confidence=min_confidence,
         psm=psm,
         multi_pass=multi_pass,
+        workers=workers,
     )
     ocr_result: OCRResult = engine.extract(
         str(validated_path),
@@ -305,6 +317,7 @@ def main() -> None:
             psm=args.psm,
             preprocess=not args.no_preprocess,
             multi_pass=not args.single_pass,
+            workers=args.workers,
         )
     except FileNotFoundError as exc:
         print(f"\n  ✗ Error: {exc}")

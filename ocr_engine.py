@@ -11,8 +11,10 @@ Estrategia multi-paso optimizada:
 """
 
 import math
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -103,17 +105,28 @@ class OCREngine:
     # PSMs a probar: 3=auto, 6=bloque uniforme, 4=columna
     CANDIDATE_PSMS: List[int] = [3, 6, 4]
 
+    # Número máximo de hilos razonable para Tesseract
+    _MAX_WORKERS: int = 8
+
     def __init__(
         self,
         language: str = "spa",
         min_confidence: float = 10.0,
         psm: int = 3,
         multi_pass: bool = True,
+        workers: int = 0,
     ) -> None:
         self.language = parse_languages(language)
         self.min_confidence = min_confidence
         self.psm = psm
         self.multi_pass = multi_pass
+
+        # workers=0 → auto-detectar (núcleos CPU, tope _MAX_WORKERS)
+        if workers <= 0:
+            cpu = os.cpu_count() or 4
+            self.workers = min(cpu, self._MAX_WORKERS)
+        else:
+            self.workers = min(workers, self._MAX_WORKERS)
 
     def extract(self, image_path: str, preprocess: bool = True) -> OCRResult:
         """
@@ -123,7 +136,8 @@ class OCREngine:
         y elige la que captura más texto con confianza aceptable.
         """
         logger.info("═" * 50)
-        logger.info("OCR v3 — Multi-paso: %s", "SÍ" if self.multi_pass else "NO")
+        logger.info("OCR v3 — Multi-paso: %s | Workers: %d",
+                     "SÍ" if self.multi_pass else "NO", self.workers)
         logger.info("Idioma: %s | Confianza mín: %.0f%%", self.language, self.min_confidence)
 
         if self.multi_pass and preprocess:
@@ -142,41 +156,79 @@ class OCREngine:
     # ─── Multi-paso ───────────────────────────
     def _multi_pass(self, image_path: str) -> OCRResult:
         """
-        Prueba múltiples combinaciones y elige la mejor.
+        Prueba múltiples combinaciones **en paralelo** y elige la mejor.
 
-        Score = word_count² × avg_confidence
-        (Prioriza máxima cantidad de palabras con confianza decente)
+        Usa ``ThreadPoolExecutor`` con ``self.workers`` hilos.
+        Tesseract es un proceso externo, por lo que los hilos
+        evitan el GIL y aprovechan todos los núcleos disponibles.
+
+        Score = real_words × median_confidence
         """
         variants = generate_preprocessing_variants(image_path)
 
+        # ── Construir lista de tareas (variant_idx, variant, psm) ──
+        tasks: List[Tuple[int, np.ndarray, int]] = []
+        for vi, variant in enumerate(variants):
+            for psm in self.CANDIDATE_PSMS:
+                tasks.append((vi, variant, psm))
+
+        logger.info("Multi-paso paralelo: %d tareas → %d workers",
+                     len(tasks), self.workers)
+
         best: Optional[OCRResult] = None
         best_score = -1.0
-        attempts = 0
+        completed = 0
 
-        for vi, variant in enumerate(variants):
-            h, w = variant.shape[:2]
-            for psm in self.CANDIDATE_PSMS:
-                attempts += 1
+        with ThreadPoolExecutor(max_workers=self.workers) as pool:
+            futures = {
+                pool.submit(self._eval_variant, vi, variant, psm): (vi, psm)
+                for vi, variant, psm in tasks
+            }
+
+            for future in as_completed(futures):
+                vi, psm = futures[future]
+                completed += 1
                 try:
-                    r = self._run_tesseract(variant, w, h, psm)
-                    score = self._score(r)
-
+                    result, score = future.result()
                     if score > best_score:
                         best_score = score
-                        best = r
+                        best = result
                         logger.info(
                             "★ Mejor: V%d PSM%d — %d palabras, "
                             "conf %.1f%%, score %.0f",
-                            vi, psm, r.word_count, r.avg_confidence, score,
+                            vi, psm, result.word_count,
+                            result.avg_confidence, score,
                         )
-                except Exception as e:
-                    logger.debug("V%d PSM%d falló: %s", vi, psm, e)
+                except Exception as exc:
+                    logger.debug("V%d PSM%d falló: %s", vi, psm, exc)
 
-        logger.info("Multi-paso: %d intentos, score final: %.0f", attempts, best_score)
+        logger.info("Multi-paso: %d intentos, score final: %.0f",
+                     completed, best_score)
 
         if best is None:
             return OCRResult(language=self.language)
         return best
+
+    def _eval_variant(
+        self, vi: int, variant: np.ndarray, psm: int,
+    ) -> Tuple[OCRResult, float]:
+        """
+        Evalúa una combinación variante + PSM.
+
+        Función auxiliar thread-safe para ejecución paralela.
+
+        Args:
+            vi: Índice de la variante (solo para logging).
+            variant: Imagen preprocesada.
+            psm: Modo de segmentación de página.
+
+        Returns:
+            Tupla ``(OCRResult, score)``.
+        """
+        h, w = variant.shape[:2]
+        r = self._run_tesseract(variant, w, h, psm)
+        score = self._score(r)
+        return r, score
 
     def _single_pass(self, image_path: str, preprocess: bool) -> OCRResult:
         """Extracción de un solo paso."""
@@ -782,6 +834,6 @@ def quick_extract(image_path: str, lang: str = "spa") -> str:
     Returns:
         Texto extraído.
     """
-    engine = OCREngine(lang=lang)
-    result = engine.process_image(image_path)
-    return result.full_text
+    engine = OCREngine(language=lang)
+    result = engine.extract(image_path)
+    return result.raw_text

@@ -304,7 +304,28 @@ class ImageRDApp(ctk.CTk):
             values=list(PSM_MODES.keys()),
             variable=self._psm_var,
             height=30, font=ctk.CTkFont(size=11),
-        ).grid(row=r, column=0, padx=20, pady=(0, 20), sticky="ew"); r += 1
+        ).grid(row=r, column=0, padx=20, pady=(0, 12), sticky="ew"); r += 1
+
+        # Workers (paralelismo)
+        import os as _os
+        _cpu = _os.cpu_count() or 4
+        _max_w = min(_cpu, 8)
+
+        ctk.CTkLabel(
+            self.sidebar, text=f"Workers (hilos) — CPU: {_cpu} núcleos",
+            font=ctk.CTkFont(size=11), text_color="gray",
+        ).grid(row=r, column=0, padx=20, pady=(8, 2), sticky="w"); r += 1
+
+        self._workers_var = ctk.IntVar(value=0)
+        _worker_values = ["0 — Auto"] + [str(i) for i in range(1, _max_w + 1)]
+        self._workers_menu = ctk.CTkOptionMenu(
+            self.sidebar,
+            values=_worker_values,
+            command=self._on_workers_change,
+            height=30, font=ctk.CTkFont(size=11),
+        )
+        self._workers_menu.set("0 — Auto")
+        self._workers_menu.grid(row=r, column=0, padx=20, pady=(0, 20), sticky="ew"); r += 1
 
         # ── BOTÓN PROCESAR ──
         self._process_btn = ctk.CTkButton(
@@ -533,6 +554,13 @@ class ImageRDApp(ctk.CTk):
     # ─────────────────────────────────────────
     # Controles de la sidebar
     # ─────────────────────────────────────────
+    def _on_workers_change(self, value: str):
+        """Actualiza variable interna al cambiar selector de workers."""
+        try:
+            self._workers_var.set(int(value.split(" ")[0]))
+        except (ValueError, IndexError):
+            self._workers_var.set(0)
+
     def _on_confidence_change(self, value):
         """Actualiza el label cuando el slider de confianza cambia."""
         self._conf_label.configure(text=f"{int(value)} %")
@@ -597,6 +625,7 @@ class ImageRDApp(ctk.CTk):
             psm=PSM_MODES.get(self._psm_var.get(), 3),
             preprocess=self._preproc_var.get(),
             multi_pass=self._multipass_var.get(),
+            workers=self._workers_var.get(),
         )
 
         # ── Lanzar hilo ──
@@ -623,6 +652,7 @@ class ImageRDApp(ctk.CTk):
                 min_confidence=params["min_confidence"],
                 psm=params["psm"],
                 multi_pass=params["multi_pass"],
+                workers=params["workers"],
             )
             ocr_result: OCRResult = engine.extract(
                 params["image_path"],
