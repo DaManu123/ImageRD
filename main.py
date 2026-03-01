@@ -312,14 +312,11 @@ def main() -> None:
     except ValueError as exc:
         print(f"\n  ✗ Error de configuración: {exc}")
         sys.exit(1)
-    except EnvironmentError as exc:
-        print(f"\n  ✗ Error de entorno: {exc}")
+    except OSError as exc:
+        print(f"\n  ✗ Error de entorno/archivo: {exc}")
         sys.exit(1)
     except RuntimeError as exc:
         print(f"\n  ✗ Error en OCR: {exc}")
-        sys.exit(1)
-    except IOError as exc:
-        print(f"\n  ✗ Error de imagen: {exc}")
         sys.exit(1)
     except KeyboardInterrupt:
         print("\n\n  Operación cancelada por el usuario.")

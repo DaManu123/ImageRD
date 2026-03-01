@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from docx import Document as DocxDocument
+from docx.document import Document as DocxDocumentType
 from docx.shared import Pt, Inches, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 
@@ -290,7 +291,7 @@ def export_to_docx(
 
 
 def _build_docx_content(
-    doc: DocxDocument,
+    doc: DocxDocumentType,
     ocr_result: OCRResult,
     reconstructed: ReconstructedDocument,
 ) -> None:
