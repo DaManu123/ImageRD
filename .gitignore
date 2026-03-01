@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Entornos virtuales
+venv/
+env/
+.env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Resultados generados (cada usuario genera los suyos)
+resultados/
+
+# Imágenes de prueba
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.tiff
+*.tif
+*.bmp
+
+# Archivos de resultado sueltos
+*_resultado.*
+
+# OS
+Thumbs.db
+.DS_Store
