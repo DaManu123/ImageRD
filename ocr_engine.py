@@ -544,6 +544,153 @@ _RADIO_CONFUSIONS = {
     "©", "®", "™", "¢", "Ø", "ø",  # símbolos confundidos con círculos
 }
 
+# ─── Whitelist de palabras frecuentes que empiezan con O/o ───
+# Estas palabras NO deben ser tratadas como radio button + texto.
+# Solo se consideran los primeros 2-4 caracteres para matching rápido.
+# Si la línea empieza con una de estas palabras, se deja intacta.
+_O_WORD_PREFIXES: set = {
+    # ── Palabras comunes en español que empiezan con O ──
+    "Ob", "Oc", "Of", "Oh", "Oi", "Oj", "Ok", "Ol", "Om",
+    "On", "Op", "Oq", "Os", "Ou", "Ov", "Ow", "Ox", "Oy", "Oz",
+    "ob", "oc", "od", "of", "oh", "oi", "oj", "ok", "ol", "om",
+    "on", "op", "oq", "os", "ou", "ov", "ow", "ox", "oy", "oz",
+    # ── Bigramas de alta frecuencia que NO son radio button ──
+    # "Or" y "or" son ambiguos (opción "r" vs palabra "Orden")
+    # Se resuelven por contexto más abajo.
+    # "Ot" se incluye porque "Otro/Otra" es muy frecuente
+    "Ot", "ot",
+}
+
+# Palabras completas que empiezan con "Or"/"or" y NO son radio button.
+# Si el texto tras "O" forma una de estas, se preserva la palabra.
+_OR_SAFE_WORDS: set = {
+    "Orden", "orden", "Ordena", "ordena", "Ordenar", "ordenar",
+    "Ordenado", "ordenado", "Ordenamiento", "ordenamiento",
+    "Origen", "origen", "Original", "original",
+    "Orientación", "orientación", "Orientado", "orientado",
+    "Oración", "oración",
+    "Organizar", "organizar", "Organización", "organización",
+    "Oro", "oro",
+}
+
+
+def _split_radio_prefix(line: str) -> str:
+    """
+    Separa un prefijo de radio button del texto de la opción.
+
+    Detecta cuando Tesseract ha leído el círculo de un radio button
+    como "O", "o" o "0" y lo ha concatenado (con o sin espacio) al
+    texto real de la opción. Reemplaza el prefijo por ○ + espacio.
+
+    Lógica de decisión (en orden):
+      1. Línea vacía o de 1 carácter → no tocar.
+      2. Ya empieza con ○/☐/☑ → no tocar.
+      3. Empieza con símbolo confundido (©®™¢Øø) → reemplazar.
+      4. Empieza con O/o/0 seguido de espacio y texto → reemplazar
+         EXCEPTO si el texto que sigue forma una palabra española
+         conocida con el prefijo (e.g., "Otro", "Obtener").
+      5. Empieza con O/o/0 concatenado SIN espacio al texto → separar
+         y reemplazar, EXCEPTO si forma palabra española conocida.
+
+    Args:
+        line: Línea de texto individual.
+
+    Returns:
+        Línea con el prefijo corregido, o la línea original si
+        no se detectó radio button.
+    """
+    import re
+
+    stripped = line.strip()
+    if len(stripped) <= 1:
+        return line
+
+    # ── Ya tiene marcador de radio/checkbox → preservar ──
+    if stripped[0] in ("○", "☐", "☑"):
+        return line
+
+    # ── Preservar indentación original ──
+    indent = len(line) - len(line.lstrip())
+    prefix_spaces = line[:indent]
+
+    # ── Símbolo confundido con círculo al inicio → ○ ──
+    for sym in _RADIO_CONFUSIONS:
+        if stripped.startswith(sym):
+            rest = stripped[len(sym):].lstrip()
+            if rest:
+                return f"{prefix_spaces}○ {rest}"
+            return f"{prefix_spaces}○"
+
+    # ── No empieza con O/o/0 → no es radio button ──
+    if stripped[0] not in ("O", "o", "0"):
+        return line
+
+    # Extraer el primer carácter y el resto
+    first_char = stripped[0]
+    rest_raw = stripped[1:]  # todo lo que viene después de O/o/0
+
+    # ── CASO 1: "O " + texto  (con espacio) ──
+    # Ejemplo: "O .csv", "O Texto de opción", "O r"
+    if rest_raw and rest_raw[0] == " ":
+        rest_text = rest_raw.lstrip()
+        if not rest_text:
+            return line  # "O " sola → no tocar
+
+        # Verificar si "O" + rest_text forma palabra conocida
+        # (esto no aplica con espacio, la "O" es claramente separada)
+        # Solo verificar "Or" + espacio ya que "Or" es ambiguo
+        if first_char == "O" and rest_text and rest_text[0] == "r":
+            # ¿El texto después forma una palabra "Or..." conocida?
+            candidate = "O" + rest_text.split()[0] if rest_text else ""
+            if candidate in _OR_SAFE_WORDS:
+                return line  # "O rienta..." → "Orienta..." (no radio)
+
+        return f"{prefix_spaces}○ {rest_text}"
+
+    # ── CASO 2: "O" pegado al texto sin espacio ──
+    # Ejemplos: "Oo", "Or", "0txt", "O.csv"
+    if not rest_raw:
+        return line  # Solo "O" aislada → no tocar (podría ser respuesta)
+
+    # Sub-caso 2a: "O" + punto/coma/extensión → "○ .csv", "○ .txt"
+    # Match: "O.xxx" donde xxx es extensión de archivo o similar
+    m_ext = re.match(r'^[\.,:;](.*)$', rest_raw)
+    if m_ext:
+        return f"{prefix_spaces}○ {rest_raw}"
+
+    # Sub-caso 2b: "0txt" → dígito cero + texto
+    if first_char == "0" and rest_raw and rest_raw[0].isalpha():
+        # "0txt" es claramente 0 + txt (no hay palabra "0txt")
+        return f"{prefix_spaces}○ {rest_raw}"
+
+    # Sub-caso 2c: "O" + letra → verificar si forma palabra conocida
+    if rest_raw and rest_raw[0].isalpha():
+        two_char = first_char + rest_raw[0]  # e.g., "Oo", "Or", "Ot"
+
+        # Verificar en whitelist de prefijos seguros (NO radio button)
+        if two_char in _O_WORD_PREFIXES:
+            return line  # "Otro", "Obtener", "Once", etc.
+
+        # Caso especial: "Or..." — verificar palabra completa
+        if two_char in ("Or", "or"):
+            # Extraer la primera palabra completa
+            word_match = re.match(r'^([a-záéíóúñA-ZÁÉÍÓÚÑ]+)', rest_raw)
+            if word_match:
+                candidate = first_char + word_match.group(1)
+                if candidate in _OR_SAFE_WORDS:
+                    return line
+
+        # Si el bigrama NO está en whitelist → es radio button
+        # "Oo" → "○ o",  "Or" (no en safe words) → "○ r"
+        return f"{prefix_spaces}○ {rest_raw}"
+
+    # Sub-caso 2d: "O" + dígito → probablemente dato, no radio
+    if rest_raw and rest_raw[0].isdigit():
+        return line  # "O5" podría ser dato legítimo
+
+    # ── Fallback: no modificar ──
+    return line
+
 
 def _fix_ocr_text(text: str) -> str:
     """
@@ -572,26 +719,24 @@ def _fix_ocr_text(text: str) -> str:
     text = re.sub(r'(_+)([a-záéíóúA-ZÁÉÍÓÚ])', r'\1 \2', text)
 
     # 4. ─── Normalización de radio buttons ───
-    # "O" aislada al inicio de línea seguida de texto → ○
-    # Esto captura cuando Tesseract lee el círculo del radio button
-    # como una "O" mayúscula, un "0" (cero), o "o" minúscula.
-    text = re.sub(
-        r'^([Oo0])\s+(?=[A-ZÁÉÍÓÚ\w])',
-        f'{_RADIO_BUTTON_SYMBOL} ',
-        text,
-        flags=re.MULTILINE,
-    )
+    # Usa _split_radio_prefix() por línea para detectar cuando
+    # Tesseract leyó el círculo del radio button como "O", "o", "0"
+    # y lo concatenó al texto de la opción (con o sin espacio).
+    #
+    # Ejemplos que se corrigen:
+    #   "Oo"    → "○ o"       (O + o concatenados)
+    #   "Or"    → "○ r"       (O + r concatenados, no es "Orden")
+    #   "O .csv"→ "○ .csv"    (O + espacio + extensión)
+    #   "0txt"  → "○ txt"     (cero + texto concatenado)
+    #
+    # Palabras legítimas se preservan:
+    #   "Otro"  → "Otro"      (está en _O_WORD_PREFIXES: "Ot")
+    #   "Orden" → "Orden"     (está en _OR_SAFE_WORDS)
+    lines = text.split('\n')
+    lines = [_split_radio_prefix(line) for line in lines]
+    text = '\n'.join(lines)
 
-    # Símbolos confundidos al inicio de línea → ○
-    for sym in _RADIO_CONFUSIONS:
-        text = re.sub(
-            rf'^{re.escape(sym)}\s+',
-            f'{_RADIO_BUTTON_SYMBOL} ',
-            text,
-            flags=re.MULTILINE,
-        )
-
-    # "()" o "[]" vacíos al inicio de línea → ○ (checkboxes/radios)
+    # "()" o "[]" vacíos al inicio de línea → ○ / ☐
     text = re.sub(
         r'^\(\)\s*',
         f'{_RADIO_BUTTON_SYMBOL} ',
@@ -761,6 +906,8 @@ def _normalize_option_lines(text: str) -> str:
     detectaron preguntas explícitas (formato libre o parcial).
 
     Busca líneas que parecen opciones y les agrega ○ si falta.
+    Delega la detección de radio buttons concatenados a
+    ``_split_radio_prefix()`` para evitar falsos positivos.
 
     Args:
         text: Texto completo del documento.
@@ -786,13 +933,10 @@ def _normalize_option_lines(text: str) -> str:
             result.append(f'○ {m.group(1)}')
             continue
 
-        # Patrón "O texto" / "0 texto" al inicio que parece opción
-        m = re.match(r'^[Oo0]\s+([A-ZÁÉÍÓÚ].{5,})', stripped)
-        if m:
-            result.append(f'○ {m.group(1)}')
-            continue
-
-        result.append(line)
+        # Delegar detección de O/o/0 + texto a _split_radio_prefix()
+        # que ya maneja concatenaciones y whitelist de palabras
+        fixed = _split_radio_prefix(line)
+        result.append(fixed)
 
     return '\n'.join(result)
 
@@ -1023,6 +1167,12 @@ def _clean_option_text(text: str) -> str:
 
     Elimina marcadores de radio button, letras de opción, y
     artefactos que Tesseract introduce al leer formularios web.
+    Maneja tanto prefijos separados por espacio como concatenados
+    (ej: "Or" → "r", "0txt" → "txt", "O .csv" → ".csv").
+
+    Se ejecuta DESPUÉS de que _split_radio_prefix() ya haya
+    normalizado la línea, así que aquí solo se limpian residuos
+    dentro del contexto de una opción ya clasificada.
 
     Args:
         text: Texto de una opción individual.
@@ -1035,8 +1185,28 @@ def _clean_option_text(text: str) -> str:
     # Quitar ○/☐/☑ ya existente si se duplicaría
     text = re.sub(r'^[○☐☑]\s*', '', text)
 
-    # Quitar "O "/"o "/"0 " al inicio si es residuo del radio button
-    text = re.sub(r'^[Oo0]\s+(?=[A-ZÁÉÍÓÚ])', '', text)
+    # ── Separar O/o/0 concatenados con texto (casos residuales) ──
+    # "Oo" → "o", "Or" → "r", "0txt" → "txt", "O.csv" → ".csv"
+    # Solo si el bigrama NO es prefijo de palabra española conocida.
+    m = re.match(r'^([Oo0])([a-záéíóúñ\\.].*)$', text)
+    if m:
+        prefix_char = m.group(1)
+        rest = m.group(2)
+        two_char = prefix_char + rest[0] if rest else ""
+
+        # Si el bigrama está en whitelist de palabras españolas → no tocar
+        if two_char not in _O_WORD_PREFIXES:
+            # Verificar palabras "Or..." en safelist
+            if two_char in ("Or", "or"):
+                word_m = re.match(r'^([a-záéíóúñ]+)', rest, re.IGNORECASE)
+                candidate = prefix_char + (word_m.group(1) if word_m else "")
+                if candidate not in _OR_SAFE_WORDS:
+                    text = rest
+            else:
+                text = rest
+
+    # Quitar "O "/"o "/"0 " con espacio al inicio
+    text = re.sub(r'^[Oo0]\s+', '', text)
 
     # Quitar letras como opción: a) b) c) d) A) B) C) D)
     text = re.sub(r'^[a-dA-D][\)\.]\s*', '', text)
