@@ -26,6 +26,7 @@ from image_processing import (
     preprocess_image,
     generate_preprocessing_variants,
     analyze_optimal_psm,
+    analyze_image_quality,
     smart_load,
     convert_to_grayscale,
     upscale_for_ocr,
@@ -130,6 +131,81 @@ class OCRResult:
     avg_confidence: float = 0.0
 
 
+# ─── Detección de CPU y workers óptimos ───────
+def get_cpu_info() -> Dict[str, int]:
+    """Detecta núcleos físicos e hilos lógicos del CPU.
+
+    Intenta leer la topología real (cores × threads-per-core).
+    Fallback a ``os.cpu_count()`` si no puede determinar la topología.
+
+    Returns:
+        Diccionario con claves ``'cores'``, ``'threads'``, ``'sockets'``.
+    """
+    threads = os.cpu_count() or 4
+    cores = threads
+    sockets = 1
+
+    # Intentar leer topología real en Linux
+    try:
+        with open("/proc/cpuinfo", "r") as f:
+            cpuinfo = f.read()
+        # Contar núcleos físicos únicos (core id por procesador)
+        physical_ids = set()
+        core_ids = set()
+        current_phys = "0"
+        for line in cpuinfo.splitlines():
+            if line.startswith("physical id"):
+                current_phys = line.split(":")[1].strip()
+            elif line.startswith("core id"):
+                core_id = line.split(":")[1].strip()
+                core_ids.add((current_phys, core_id))
+                physical_ids.add(current_phys)
+        if core_ids:
+            cores = len(core_ids)
+            sockets = len(physical_ids)
+    except (OSError, ValueError):
+        # Fallback: asumir hyper-threading 2:1 si threads > 1
+        if threads > 1:
+            cores = max(1, threads // 2)
+
+    return {"cores": cores, "threads": threads, "sockets": sockets}
+
+
+def get_optimal_workers(task_count: int = 0) -> int:
+    """Calcula el número óptimo de workers paralelos.
+
+    Tesseract se ejecuta como proceso externo (subprocess), por lo que
+    los threads de Python NO compiten por el GIL. Podemos usar hasta
+    todos los hilos lógicos del CPU.
+
+    La fórmula reserva 1-2 hilos para el sistema y la GUI, y no
+    crea más workers que tareas pendientes.
+
+    Args:
+        task_count: Número de tareas a ejecutar (0 = sin límite).
+
+    Returns:
+        Número de workers óptimo (≥ 1).
+    """
+    info = get_cpu_info()
+    threads = info["threads"]
+
+    # Reservar hilos para el sistema / GUI:
+    # ≤4 hilos: reservar 1, ≤8: reservar 2, >8: reservar 2
+    if threads <= 4:
+        reserved = 1
+    else:
+        reserved = 2
+
+    optimal = max(1, threads - reserved)
+
+    # No crear más workers que tareas
+    if task_count > 0:
+        optimal = min(optimal, task_count)
+
+    return optimal
+
+
 # ─── Motor OCR ────────────────────────────────
 class OCREngine:
     """
@@ -140,50 +216,71 @@ class OCREngine:
     umbral mínimo de confianza para filtrar basura.
     """
 
-    # PSMs a probar: 3=auto, 6=bloque uniforme, 4=columna
-    CANDIDATE_PSMS: List[int] = [3, 6, 4]
+    # PSMs a probar: 3=auto, 6=bloque uniforme (PSM 4 eliminado — rara vez gana)
+    CANDIDATE_PSMS: List[int] = [3, 6]
 
-    # Número máximo de hilos razonable para Tesseract
-    _MAX_WORKERS: int = 8
+    # Umbral de score para early termination en Fase 1.
+    # Si una combinación supera este score, no se prueban más variantes.
+    # Calculado como: ~30 palabras reales × ~80% confianza mediana = 2400
+    _EARLY_STOP_SCORE: float = 2400.0
 
     def __init__(
         self,
         language: str = "spa",
-        min_confidence: float = 5.0,
+        min_confidence: float = 0.0,
         psm: int = 3,
         multi_pass: bool = True,
         workers: int = 0,
         auto_psm: bool = True,
     ) -> None:
         self.language = parse_languages(language)
-        self.min_confidence = min_confidence
+        # Confianza siempre auto-adaptativa (ignora valores del usuario)
+        self.min_confidence = 0.0
         self.psm = psm
         self.multi_pass = multi_pass
         self.auto_psm = auto_psm
 
-        # workers=0 → auto-detectar (núcleos CPU, tope _MAX_WORKERS)
+        # workers=0 → auto-detectar: usar todos los hilos lógicos del CPU.
+        # Tesseract es proceso externo (subprocess) → los threads de Python
+        # no compiten por el GIL, así que podemos usar todos los hilos.
         if workers <= 0:
-            cpu = os.cpu_count() or 4
-            self.workers = min(cpu, self._MAX_WORKERS)
+            self.workers = get_optimal_workers()
         else:
-            self.workers = min(workers, self._MAX_WORKERS)
+            self.workers = max(1, workers)
 
     def extract(self, image_path: str, preprocess: bool = True) -> OCRResult:
         """
         Extracción OCR completa.
 
-        En modo multi-paso, prueba ~18 combinaciones (6 variantes × 3 PSMs)
-        y elige la que captura más texto con confianza aceptable.
+        En modo multi-paso, usa estrategia de dos fases:
+          - Fase 1: variantes prioritarias × PSMs óptimos (rápido, ~4 llamadas).
+          - Fase 2: variantes restantes (solo si Fase 1 no fue suficiente).
+
+        La confianza es siempre auto-adaptativa según calidad de imagen.
         """
         # Asegurar que Tesseract esté disponible
         _ensure_tesseract()
+
+        # ── Cargar imagen una sola vez y compartir entre análisis ──
+        img = smart_load(image_path)
+        gray = convert_to_grayscale(img)
+        _preloaded = {"img": img, "gray": gray}
+
+        # ── Confianza siempre adaptativa ──
+        quality = analyze_image_quality(image_path, _preloaded=_preloaded)
+        self.min_confidence = quality["suggested_confidence"]
+        logger.info("Confianza adaptativa: calidad=%s → umbral=%.0f%%",
+                     quality["quality_tier"], self.min_confidence)
+
+        cpu_info = get_cpu_info()
         logger.info("═" * 50)
-        logger.info("OCR v3 — Multi-paso: %s | Workers: %d",
-                     "SÍ" if self.multi_pass else "NO", self.workers)
+        logger.info("OCR v5 — Multi-paso: %s | Workers: %d/%d hilos (%d cores)",
+                     "SÍ" if self.multi_pass else "NO",
+                     self.workers, cpu_info["threads"], cpu_info["cores"])
         logger.info("Idioma: %s | Confianza mín: %.0f%%", self.language, self.min_confidence)
 
         if self.multi_pass and preprocess:
-            result = self._multi_pass(image_path)
+            result = self._multi_pass(image_path, _preloaded)
         else:
             result = self._single_pass(image_path, preprocess)
 
@@ -195,40 +292,154 @@ class OCREngine:
         logger.info("═" * 50)
         return result
 
-    # ─── Multi-paso ───────────────────────────
-    def _multi_pass(self, image_path: str) -> OCRResult:
+    # ─── Multi-paso optimizado (dos fases + early termination) ──
+    def _multi_pass(
+        self, image_path: str, _preloaded: Optional[Dict] = None,
+    ) -> OCRResult:
         """
-        Prueba múltiples combinaciones **en paralelo** y elige la mejor.
+        Estrategia de dos fases con early termination.
 
-        Usa ``ThreadPoolExecutor`` con ``self.workers`` hilos.
-        Tesseract es un proceso externo, por lo que los hilos
-        evitan el GIL y aprovechan todos los núcleos disponibles.
+        **Fase 1 (rápida):** ejecuta las 3 variantes prioritarias
+        (V0=pipeline completo, V1=upscale puro, V2=CLAHE+sharpen)
+        con los 2 mejores PSMs = ~6 llamadas a Tesseract.
+        Si algún resultado supera ``_EARLY_STOP_SCORE``, se detiene.
+
+        **Fase 2 (complementaria):** solo si Fase 1 no alcanzó un
+        score suficiente, ejecuta las variantes restantes (binarizadas,
+        examen) con los PSMs faltantes.
 
         Score = real_words × median_confidence
+
+        Esta estrategia reduce de ~24 llamadas a ~4-6 en el caso
+        típico (screenshots con texto legible), logrando ~5x speedup.
         """
-        variants = generate_preprocessing_variants(image_path)
+        # ── Precarga de datos compartidos ──
+        if _preloaded is None:
+            _preloaded = {}
+        if "img" not in _preloaded:
+            _preloaded["img"] = smart_load(image_path)
+        if "gray" not in _preloaded:
+            _preloaded["gray"] = convert_to_grayscale(_preloaded["img"])
+        if "is_ss" not in _preloaded:
+            from image_processing import _detect_if_screenshot
+            _preloaded["is_ss"] = _detect_if_screenshot(_preloaded["img"])
+        if "up" not in _preloaded:
+            _preloaded["up"] = upscale_for_ocr(_preloaded["gray"])
+
+        variants = generate_preprocessing_variants(
+            image_path, _preloaded=_preloaded,
+        )
 
         # ── Determinar orden de PSMs ──
         if self.auto_psm:
-            psm_order = analyze_optimal_psm(image_path)
+            psm_order = analyze_optimal_psm(
+                image_path, _preloaded=_preloaded,
+            )
             logger.info("Auto-PSM: orden optimizado %s", psm_order)
         else:
             psm_order = self.CANDIDATE_PSMS
 
-        # ── Construir lista de tareas (variant_idx, variant, psm) ──
-        tasks: List[Tuple[int, np.ndarray, int]] = []
-        for vi, variant in enumerate(variants):
-            for psm in psm_order:
-                tasks.append((vi, variant, psm))
+        # ── Separar variantes en Fase 1 (prioritarias) y Fase 2 ──
+        # Las 3 primeras variantes son las más probables ganadoras
+        PHASE1_VARIANTS = min(3, len(variants))
+        phase1_variants = variants[:PHASE1_VARIANTS]
+        phase2_variants = variants[PHASE1_VARIANTS:]
 
-        logger.info("Multi-paso paralelo: %d tareas → %d workers",
-                     len(tasks), self.workers)
+        # ── FASE 1A: variantes top × MEJOR PSM (batch mínimo) ──
+        # Primero probar solo el PSM más probable para detectar early stop rápido
+        best_psm = psm_order[0] if psm_order else 3
+        phase1a_tasks: List[Tuple[int, np.ndarray, int]] = [
+            (vi, variant, best_psm)
+            for vi, variant in enumerate(phase1_variants)
+        ]
 
+        effective_workers = min(self.workers, len(phase1a_tasks))
+        logger.info("Fase 1A: %d tareas (V0-V2 × PSM%d) → %d workers",
+                     len(phase1a_tasks), best_psm, effective_workers)
+
+        best, best_score, completed = self._run_phase(
+            phase1a_tasks, effective_workers,
+        )
+
+        logger.info("Fase 1A completada: %d intentos, score=%.0f",
+                     completed, best_score)
+
+        # ── FASE 1B: mismo set × PSMs restantes (si Phase 1A insuficiente) ──
+        remaining_psms = [p for p in psm_order if p != best_psm]
+        if best_score < self._EARLY_STOP_SCORE and remaining_psms:
+            phase1b_tasks: List[Tuple[int, np.ndarray, int]] = []
+            for vi, variant in enumerate(phase1_variants):
+                for psm in remaining_psms:
+                    phase1b_tasks.append((vi, variant, psm))
+
+            effective_workers_1b = min(self.workers, len(phase1b_tasks))
+            logger.info("Fase 1B: %d tareas → %d workers",
+                         len(phase1b_tasks), effective_workers_1b)
+
+            best1b, score1b, completed1b = self._run_phase(
+                phase1b_tasks, effective_workers_1b,
+            )
+            completed += completed1b
+            if best1b is not None and score1b > best_score:
+                best = best1b
+                best_score = score1b
+        else:
+            logger.info("Score suficiente tras Fase 1A → omitiendo Fase 1B")
+
+        logger.info("Fase 1 total: score=%.0f", best_score)
+
+        # ── FASE 2 (solo si score insuficiente) ──
+        if best_score < self._EARLY_STOP_SCORE and phase2_variants:
+            logger.info("Score Fase 1 (%.0f) < umbral (%.0f) → ejecutando Fase 2...",
+                         best_score, self._EARLY_STOP_SCORE)
+
+            phase2_tasks: List[Tuple[int, np.ndarray, int]] = []
+            for vi_offset, variant in enumerate(phase2_variants):
+                vi = PHASE1_VARIANTS + vi_offset
+                for psm in psm_order:
+                    phase2_tasks.append((vi, variant, psm))
+
+            effective_workers2 = min(self.workers, len(phase2_tasks))
+            logger.info("Fase 2: %d tareas → %d workers", len(phase2_tasks), effective_workers2)
+
+            best2, best_score2, completed2 = self._run_phase(phase2_tasks, effective_workers2)
+            completed += completed2
+
+            if best2 is not None and best_score2 > best_score:
+                best = best2
+                best_score = best_score2
+                logger.info("Fase 2 mejoró score: %.0f", best_score)
+        else:
+            logger.info("Score Fase 1 suficiente (%.0f ≥ %.0f) → omitiendo Fase 2",
+                         best_score, self._EARLY_STOP_SCORE)
+
+        logger.info("Multi-paso total: %d intentos, score final: %.0f",
+                     completed, best_score)
+
+        if best is None:
+            return OCRResult(language=self.language)
+        return best
+
+    def _run_phase(
+        self,
+        tasks: List[Tuple[int, np.ndarray, int]],
+        workers: int,
+    ) -> Tuple[Optional[OCRResult], float, int]:
+        """
+        Ejecuta un conjunto de tareas OCR en paralelo con early termination.
+
+        Args:
+            tasks: Lista de (variant_idx, variant_image, psm).
+            workers: Número de workers paralelos.
+
+        Returns:
+            Tupla (mejor_resultado, mejor_score, tareas_completadas).
+        """
         best: Optional[OCRResult] = None
         best_score = -1.0
         completed = 0
 
-        with ThreadPoolExecutor(max_workers=self.workers) as pool:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = {
                 pool.submit(self._eval_variant, vi, variant, psm): (vi, psm)
                 for vi, variant, psm in tasks
@@ -248,15 +459,20 @@ class OCREngine:
                             vi, psm, result.word_count,
                             result.avg_confidence, score,
                         )
+
+                    # ── Early termination ──
+                    if best_score >= self._EARLY_STOP_SCORE:
+                        # Cancelar tareas pendientes
+                        for f in futures:
+                            f.cancel()
+                        logger.info("Early stop: score %.0f ≥ %.0f",
+                                     best_score, self._EARLY_STOP_SCORE)
+                        break
+
                 except Exception as exc:
                     logger.debug("V%d PSM%d falló: %s", vi, psm, exc)
 
-        logger.info("Multi-paso: %d intentos, score final: %.0f",
-                     completed, best_score)
-
-        if best is None:
-            return OCRResult(language=self.language)
-        return best
+        return best, best_score, completed
 
     def _eval_variant(
         self, vi: int, variant: np.ndarray, psm: int,

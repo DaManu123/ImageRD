@@ -100,12 +100,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Ruta personalizada para el archivo de salida.",
     )
 
-    # Confianza mínima
+    # Confianza mínima — ghost param: siempre auto-adaptativa.
+    # Se mantiene por compatibilidad de scripts existentes, pero el valor
+    # se ignora internamente (OCREngine fuerza mode auto).
     parser.add_argument(
         "--min-confidence", "-mc",
         type=float,
-        default=5.0,
-        help="Confianza mínima para incluir palabras (0-100, default: 5).",
+        default=0.0,
+        help=argparse.SUPPRESS,  # oculto — siempre auto
     )
 
     # PSM (Page Segmentation Mode)
@@ -181,7 +183,7 @@ def run_pipeline(
     output_format: str = "txt",
     language: str = "spa",
     output_path: Optional[str] = None,
-    min_confidence: float = 5.0,
+    min_confidence: float = 0.0,
     psm: int = 3,
     preprocess: bool = True,
     multi_pass: bool = True,
@@ -227,6 +229,7 @@ def run_pipeline(
     print(f"  ✓ Formato salida: {validated_format}")
     print(f"  ✓ Idioma: {language}")
     print(f"  ✓ Multi-paso: {'Sí' if multi_pass else 'No'}")
+    print(f"  ✓ Confianza mín: Auto (adaptativa)")
 
     # ── Paso 2: Extracción OCR ──
     print("\n▸ Procesando imagen (esto puede tomar unos segundos)...")
@@ -248,7 +251,6 @@ def run_pipeline(
         print("  Sugerencias:")
         print("    - Verifica que la imagen contenga texto legible.")
         print("    - Prueba con --no-preprocess si el preprocesamiento distorsiona.")
-        print("    - Ajusta --min-confidence a un valor menor.")
         print("    - Verifica que el idioma (--lang) sea correcto.")
         return []
 

@@ -18,10 +18,12 @@ Uso:
 """
 
 import os
+import io
 import sys
 import time
 import logging
 import platform
+import tempfile
 import threading
 import subprocess
 from pathlib import Path
@@ -37,7 +39,7 @@ from utils import (
     validate_output_format,
     SUPPORTED_FORMATS,
 )
-from ocr_engine import OCREngine, OCRResult
+from ocr_engine import OCREngine, OCRResult, get_cpu_info, get_optimal_workers
 from layout_reconstructor import LayoutReconstructor, ReconstructedDocument
 from exporters import export_all
 
@@ -152,6 +154,7 @@ class ImageRDApp(ctk.CTk):
         self._reconstructed: Optional[ReconstructedDocument] = None
         self._generated_files: List[Path] = []
         self._processing = False
+        self._temp_files: List[Path] = []  # archivos temporales del portapapeles
 
         # ── Tema por defecto ──
         ctk.set_appearance_mode("dark")
@@ -167,6 +170,9 @@ class ImageRDApp(ctk.CTk):
         self._log_handler = _GUILogHandler(self._on_log_message)
         self._log_handler.setFormatter(logging.Formatter("%(message)s"))
         logger.addHandler(self._log_handler)
+
+        # ── Atajo de teclado: Ctrl+V para pegar imagen ──
+        self.bind("<Control-v>", lambda e: self._paste_image_from_clipboard())
 
         # ── Manejar cierre de ventana ──
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -225,7 +231,7 @@ class ImageRDApp(ctk.CTk):
 
         self._thumb_label = ctk.CTkLabel(
             self._thumb_frame,
-            text="Sin imagen seleccionada\n\nHaz clic en «Seleccionar»",
+            text="Sin imagen seleccionada\n\n«Seleccionar» o Ctrl+V para pegar",
             font=ctk.CTkFont(size=11),
             text_color="gray",
         )
@@ -243,7 +249,17 @@ class ImageRDApp(ctk.CTk):
             self.sidebar, text="📂  Seleccionar imagen",
             command=self._browse_image, height=34,
         )
-        self._browse_btn.grid(row=r, column=0, padx=20, pady=(0, 16), sticky="ew"); r += 1
+        self._browse_btn.grid(row=r, column=0, padx=20, pady=(0, 4), sticky="ew"); r += 1
+
+        # Botón pegar desde portapapeles
+        self._paste_btn = ctk.CTkButton(
+            self.sidebar, text="📋  Pegar imagen  (Ctrl+V)",
+            command=self._paste_image_from_clipboard, height=34,
+            fg_color="transparent", border_width=1,
+            text_color=("gray10", "gray90"),
+            border_color=("gray50", "gray50"),
+        )
+        self._paste_btn.grid(row=r, column=0, padx=20, pady=(0, 16), sticky="ew"); r += 1
 
         # ── FORMATO DE SALIDA ──
         r = self._section_header(r, "FORMATO DE SALIDA")
@@ -279,24 +295,33 @@ class ImageRDApp(ctk.CTk):
         self._multipass_var = ctk.BooleanVar(value=True)
         r = self._switch_row(r, "Multi-paso (más preciso)", self._multipass_var)
 
-        # Info: PSM se auto-detecta
+        # Info: PSM y confianza auto-detectados
         ctk.CTkLabel(
             self.sidebar, text="PSM: auto-detección inteligente ✓",
             font=ctk.CTkFont(size=11), text_color="gray",
-        ).grid(row=r, column=0, padx=20, pady=(8, 12), sticky="w"); r += 1
-
-        # Workers (paralelismo)
-        import os as _os
-        _cpu = _os.cpu_count() or 4
-        _max_w = min(_cpu, 8)
-
-        ctk.CTkLabel(
-            self.sidebar, text=f"Workers (hilos) — CPU: {_cpu} núcleos",
-            font=ctk.CTkFont(size=11), text_color="gray",
         ).grid(row=r, column=0, padx=20, pady=(8, 2), sticky="w"); r += 1
 
+        ctk.CTkLabel(
+            self.sidebar, text="Confianza: adaptativa automática ✓",
+            font=ctk.CTkFont(size=11), text_color="gray",
+        ).grid(row=r, column=0, padx=20, pady=(2, 12), sticky="w"); r += 1
+
+        # ── PARALELISMO ──
+        r = self._section_header(r, "PARALELISMO")
+
+        _cpu_info = get_cpu_info()
+        _cores = _cpu_info["cores"]
+        _threads = _cpu_info["threads"]
+        _optimal = get_optimal_workers()
+
+        ctk.CTkLabel(
+            self.sidebar,
+            text=f"CPU: {_cores} cores / {_threads} hilos → {_optimal} workers",
+            font=ctk.CTkFont(size=11), text_color="gray",
+        ).grid(row=r, column=0, padx=20, pady=(4, 2), sticky="w"); r += 1
+
         self._workers_var = ctk.IntVar(value=0)
-        _worker_values = ["0 — Auto"] + [str(i) for i in range(1, _max_w + 1)]
+        _worker_values = ["0 — Auto"] + [str(i) for i in range(1, _threads + 1)]
         self._workers_menu = ctk.CTkOptionMenu(
             self.sidebar,
             values=_worker_values,
@@ -499,6 +524,101 @@ class ImageRDApp(ctk.CTk):
         if path:
             self._load_image(path)
 
+    def _paste_image_from_clipboard(self):
+        """Pega una imagen del portapapeles del sistema.
+
+        Intenta obtener la imagen con múltiples métodos según el SO:
+          1. PIL.ImageGrab.grabclipboard() (Windows, macOS, Linux con
+             wl-paste o xclip)
+          2. Subproceso wl-paste (Wayland)
+          3. Subproceso xclip (X11)
+
+        La imagen se guarda como PNG temporal y se carga como imagen
+        de entrada para el pipeline OCR.
+        """
+        if self._processing:
+            return
+
+        img = self._grab_clipboard_image()
+
+        if img is None:
+            messagebox.showinfo(
+                "Sin imagen en portapapeles",
+                "No se encontró ninguna imagen en el portapapeles.\n\n"
+                "Copia una imagen (captura de pantalla, imagen de\n"
+                "navegador, etc.) y vuelve a intentar.",
+            )
+            return
+
+        # Guardar como PNG temporal
+        try:
+            tmp = tempfile.NamedTemporaryFile(
+                suffix=".png", prefix="imageRD_clip_",
+                delete=False,
+            )
+            img.save(tmp.name, format="PNG")
+            tmp.close()
+
+            tmp_path = Path(tmp.name)
+            self._temp_files.append(tmp_path)
+
+            self._load_image(str(tmp_path))
+            self._update_status(
+                f"Imagen pegada desde portapapeles ({img.size[0]}×{img.size[1]} px)"
+            )
+        except Exception as exc:
+            messagebox.showerror(
+                "Error al pegar imagen",
+                f"No se pudo guardar la imagen del portapapeles:\n{exc}",
+            )
+
+    @staticmethod
+    def _grab_clipboard_image() -> Optional[Image.Image]:
+        """Obtiene imagen del portapapeles con múltiples estrategias.
+
+        Returns:
+            PIL.Image.Image si hay imagen, None en caso contrario.
+        """
+        from PIL import ImageGrab
+
+        # ── Método 1: PIL ImageGrab (multiplataforma) ──
+        try:
+            clip = ImageGrab.grabclipboard()
+            if isinstance(clip, Image.Image):
+                return clip
+            # En algunos casos devuelve lista de rutas de archivos
+            if isinstance(clip, list) and clip:
+                first = clip[0]
+                if isinstance(first, str) and os.path.isfile(first):
+                    return Image.open(first)
+        except Exception:
+            pass
+
+        # ── Método 2: wl-paste (Linux / Wayland) ──
+        try:
+            result = subprocess.run(
+                ["wl-paste", "--type", "image/png"],
+                capture_output=True, timeout=3,
+            )
+            if result.returncode == 0 and result.stdout:
+                return Image.open(io.BytesIO(result.stdout))
+        except (FileNotFoundError, subprocess.TimeoutExpired, Exception):
+            pass
+
+        # ── Método 3: xclip (Linux / X11) ──
+        try:
+            result = subprocess.run(
+                ["xclip", "-selection", "clipboard",
+                 "-t", "image/png", "-o"],
+                capture_output=True, timeout=3,
+            )
+            if result.returncode == 0 and result.stdout:
+                return Image.open(io.BytesIO(result.stdout))
+        except (FileNotFoundError, subprocess.TimeoutExpired, Exception):
+            pass
+
+        return None
+
     def _load_image(self, filepath: str):
         """Carga la imagen seleccionada y muestra el thumbnail."""
         self._image_path = filepath
@@ -575,6 +695,7 @@ class ImageRDApp(ctk.CTk):
         self._processing = True
         self._process_btn.configure(state="disabled", text="⏳  Procesando…")
         self._browse_btn.configure(state="disabled")
+        self._paste_btn.configure(state="disabled")
         self._copy_btn.configure(state="disabled")
         self._open_folder_btn.configure(state="disabled")
         self._open_file_btn.configure(state="disabled")
@@ -584,7 +705,7 @@ class ImageRDApp(ctk.CTk):
 
         self._set_text(
             "Procesando imagen, por favor espera…\n\n"
-            "Esto puede tomar entre 10 y 90 segundos dependiendo\n"
+            "Esto puede tomar entre 5 y 30 segundos dependiendo\n"
             "del tamaño de la imagen y las opciones seleccionadas."
         )
 
@@ -596,7 +717,7 @@ class ImageRDApp(ctk.CTk):
             image_path=self._image_path,
             output_format=self._format_var.get(),
             language=language,
-            min_confidence=5.0,
+            min_confidence=0,  # siempre auto-adaptativa
             psm=3,
             preprocess=self._preproc_var.get(),
             multi_pass=self._multipass_var.get(),
@@ -642,7 +763,6 @@ class ImageRDApp(ctk.CTk):
                     "Sugerencias:\n"
                     "  • Verifica que la imagen contenga texto legible.\n"
                     "  • Desactiva el preprocesamiento.\n"
-                    "  • Reduce la confianza mínima.\n"
                     "  • Verifica que el idioma sea correcto.",
                 )
                 return
@@ -766,6 +886,7 @@ class ImageRDApp(ctk.CTk):
             state="normal", text="🔍  PROCESAR IMAGEN",
         )
         self._browse_btn.configure(state="normal")
+        self._paste_btn.configure(state="normal")
         self._progress.stop()
         self._progress.configure(mode="determinate")
         self._progress.set(1.0)
@@ -925,6 +1046,13 @@ class ImageRDApp(ctk.CTk):
                 "Hay un procesamiento OCR en curso.\n¿Deseas cerrar de todas formas?",
             ):
                 return
+
+        # Limpiar archivos temporales del portapapeles
+        for tmp in self._temp_files:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
 
         # Limpiar log handler
         logger.removeHandler(self._log_handler)

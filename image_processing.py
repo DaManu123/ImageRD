@@ -25,7 +25,7 @@ Pipeline optimizado:
 """
 
 import math
-from typing import List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -38,8 +38,14 @@ from utils import logger
 # Constantes
 # ─────────────────────────────────────────────
 BORDER_PADDING = 80          # px — margen blanco (mayor para evitar recorte)
-MIN_UPSCALE_FACTOR = 2.0     # Siempre escalar al menos 2x
-MAX_UPSCALE_FACTOR = 4.0     # No escalar más de 4x
+MIN_UPSCALE_FACTOR = 1.5     # Mínimo de escala (permite no escalar tanto imgs grandes)
+MAX_UPSCALE_FACTOR = 4.0     # Tope absoluto de escala
+
+# Resolución objetivo: Tesseract rinde mejor con caracteres de ~30-50px de alto.
+# A 300 DPI, texto de 12pt ≈ 50px. Un target de 2200px en la dimensión menor
+# da suficiente resolución para texto legible sin el overhead de imágenes enormes.
+# Para 1920×1080: scale=2.04x → 3917×2203 (~8.6 MP) vs anterior 3000→17 MP.
+TARGET_MIN_DIMENSION = 2200  # px — dimensión mínima ideal tras upscale
 
 
 # ─────────────────────────────────────────────
@@ -51,6 +57,7 @@ def preprocess_image(
     denoise: bool = True,
     deskew: bool = True,
     binarize: bool = True,  # Se ignora para LSTM — mantenido por compatibilidad
+    _preloaded: Optional[Dict] = None,
 ) -> np.ndarray:
     """
     Pipeline de preprocesamiento optimizado para Tesseract LSTM.
@@ -65,26 +72,40 @@ def preprocess_image(
         denoise: Reducción de ruido.
         deskew: Corrección de inclinación.
         binarize: Ignorado para LSTM (por diseño).
+        _preloaded: Caché de datos precargados (img, gray, up, is_ss).
 
     Returns:
         Imagen preprocesada (escala de grises, alta resolución).
     """
-    logger.info("Cargando imagen: %s", image_path)
-    img = smart_load(image_path)
+    # ── Reutilizar datos precargados si están disponibles ──
+    if _preloaded and "img" in _preloaded:
+        img = _preloaded["img"]
+    else:
+        logger.info("Cargando imagen: %s", image_path)
+        img = smart_load(image_path)
 
     h, w = img.shape[:2]
     channels = img.shape[2] if len(img.shape) == 3 else 1
     logger.info("Imagen: %dx%d, %d canales", w, h, channels)
 
     # Detectar tipo
-    is_screenshot = _detect_if_screenshot(img)
+    if _preloaded and "is_ss" in _preloaded:
+        is_screenshot = _preloaded["is_ss"]
+    else:
+        is_screenshot = _detect_if_screenshot(img)
     logger.info("Tipo: %s", "SCREENSHOT" if is_screenshot else "FOTO/ESCANEO")
 
     # 1. Escala de grises
-    gray = _to_gray(img)
+    if _preloaded and "gray" in _preloaded:
+        gray = _preloaded["gray"].copy()
+    else:
+        gray = _to_gray(img)
 
     # 2. Upscaling — EL paso más importante para precisión
-    gray = _smart_upscale(gray)
+    if _preloaded and "up" in _preloaded:
+        gray = _preloaded["up"].copy()
+    else:
+        gray = _smart_upscale(gray)
 
     # 3. Deskew
     if deskew:
@@ -104,43 +125,66 @@ def preprocess_image(
     return processed
 
 
-def generate_preprocessing_variants(image_path: str) -> List[np.ndarray]:
+def generate_preprocessing_variants(
+    image_path: str,
+    _preloaded: Optional[Dict] = None,
+) -> List[np.ndarray]:
     """
     Genera variantes para OCR multi-paso.
 
     Para SCREENSHOTS: solo variantes en escala de grises (LSTM-optimizado).
     Para FOTOS: incluye variantes con binarización.
 
+    Las variantes se ordenan por probabilidad de mejor resultado:
+    V0 (pipeline completo) y V3 (upscale puro) primero.
+
+    Args:
+        image_path: Ruta al archivo de imagen.
+        _preloaded: Caché de datos precargados (evita recargar la imagen).
+            Claves opcionales: ``img``, ``gray``, ``up``, ``is_ss``.
+
     Returns:
-        Lista de imágenes numpy array.
+        Lista de imágenes numpy array (ordenadas por prioridad).
     """
     logger.info("Generando variantes de preprocesamiento...")
-    img = smart_load(image_path)
-    is_ss = _detect_if_screenshot(img)
-    gray = _to_gray(img)
-    up = _smart_upscale(gray)
+
+    # ── Reutilizar datos precargados si están disponibles ──
+    if _preloaded and "img" in _preloaded:
+        img = _preloaded["img"]
+    else:
+        img = smart_load(image_path)
+
+    if _preloaded and "is_ss" in _preloaded:
+        is_ss = _preloaded["is_ss"]
+    else:
+        is_ss = _detect_if_screenshot(img)
+
+    if _preloaded and "gray" in _preloaded:
+        gray = _preloaded["gray"]
+    else:
+        gray = _to_gray(img)
+
+    if _preloaded and "up" in _preloaded:
+        up = _preloaded["up"]
+    else:
+        up = _smart_upscale(gray)
 
     variants: List[np.ndarray] = []
 
-    # V0: Pipeline estándar completo
-    v0 = preprocess_image(image_path)
+    # ── Variantes ordenadas por prioridad (las más probables ganadoras primero) ──
+    # V0: Pipeline estándar completo — generalmente el mejor
+    v0 = preprocess_image(image_path, _preloaded={"img": img, "is_ss": is_ss,
+                                                    "gray": gray, "up": up})
     variants.append(v0)
 
-    # V1: Upscale + sharpen suave (mínimo procesamiento)
-    v1 = _sharpen_gentle(up.copy())
-    variants.append(_add_padding(v1))
-
-    # V2: Upscale + CLAHE suave
-    v2 = _clahe(up.copy(), clip=1.2, tile=(16, 16))
-    variants.append(_add_padding(v2))
-
-    # V3: Upscale puro (CERO procesamiento) — sorprendentemente bueno
+    # V1: Upscale puro (CERO procesamiento) — sorprendentemente bueno,
+    # segundo más probable ganador para screenshots
     variants.append(_add_padding(up.copy()))
 
-    # V4: CLAHE + sharpen combinados
-    v4 = _clahe(up.copy(), clip=1.0, tile=(16, 16))
-    v4 = _sharpen_gentle(v4)
-    variants.append(_add_padding(v4))
+    # V2: CLAHE + sharpen combinados
+    v2 = _clahe(up.copy(), clip=1.0, tile=(16, 16))
+    v2 = _sharpen_gentle(v2)
+    variants.append(_add_padding(v2))
 
     if not is_ss:
         # Solo para fotos/escaneos: incluir binarización
@@ -284,6 +328,106 @@ def _detect_if_screenshot(image: np.ndarray) -> bool:
     return is_ss
 
 
+def analyze_image_quality(image_path: str, _preloaded: Optional[Dict] = None) -> Dict:
+    """Analiza la calidad y características de una imagen para optimizar OCR.
+
+    Calcula métricas que permiten adaptar automáticamente los parámetros
+    del motor OCR (confianza mínima, variantes de preprocesamiento, etc.)
+    según la calidad real de la imagen de entrada.
+
+    Args:
+        image_path: Ruta al archivo de imagen.
+        _preloaded: Caché de datos precargados (img, gray).
+
+    Returns:
+        Diccionario con métricas:
+          - ``is_screenshot`` (bool): si es captura de pantalla.
+          - ``width``, ``height`` (int): dimensiones originales.
+          - ``total_pixels`` (int): megapíxeles totales.
+          - ``min_dimension`` (int): dimensión menor (ancho o alto).
+          - ``sharpness`` (float): varianza laplaciana (nitidez).
+          - ``entropy`` (float): entropía Shannon (complejidad).
+          - ``contrast`` (float): desviación estándar de brillo.
+          - ``suggested_confidence`` (float): confianza mínima sugerida.
+          - ``quality_tier`` (str): 'alta', 'media', 'baja'.
+    """
+    if _preloaded and "img" in _preloaded:
+        img = _preloaded["img"]
+    else:
+        img = smart_load(image_path)
+    h, w = img.shape[:2]
+
+    if _preloaded and "gray" in _preloaded:
+        gray = _preloaded["gray"]
+    else:
+        gray = _to_gray(img)
+
+    # Reducir para análisis rápido
+    small = cv2.resize(gray, (300, 300), interpolation=cv2.INTER_AREA)
+
+    # Nitidez (varianza laplaciana)
+    sharpness = float(cv2.Laplacian(small, cv2.CV_64F).var())
+
+    # Entropía (complejidad visual)
+    hist = cv2.calcHist([small], [0], None, [256], [0, 256])
+    hist = hist.flatten() / hist.sum()
+    nz = hist[hist > 0]
+    entropy = float(-np.sum(nz * np.log2(nz)))
+
+    # Contraste (desviación estándar de brillo)
+    contrast = float(np.std(small))
+
+    is_ss = sharpness > 300 and entropy < 6.8
+    min_dim = min(h, w)
+
+    # ── Determinar tier de calidad ──
+    # Alta: screenshot nítido, texto claro → podemos ser más estrictos
+    # Media: foto decente, texto legible pero con algo de ruido
+    # Baja: foto borrosa, mal contraste, imagen diminuta
+    if is_ss and sharpness > 500:
+        quality = "alta"
+    elif (sharpness > 100 and contrast > 30) or (is_ss and sharpness > 200):
+        quality = "media"
+    else:
+        quality = "baja"
+
+    # ── Confianza mínima sugerida ──
+    # Screenshots nítidos: umbral más alto (filtra más basura)
+    # Fotos buenas: umbral estándar
+    # Fotos malas / imágenes diminutas: umbral muy bajo (para no perder texto)
+    if quality == "alta":
+        suggested_conf = 15.0
+    elif quality == "media":
+        suggested_conf = 8.0
+    else:
+        suggested_conf = 3.0
+
+    # Imágenes muy pequeñas → bajar la confianza
+    if min_dim < 300:
+        suggested_conf = min(suggested_conf, 3.0)
+    elif min_dim < 600:
+        suggested_conf = min(suggested_conf, 5.0)
+
+    result = {
+        "is_screenshot": is_ss,
+        "width": w,
+        "height": h,
+        "total_pixels": h * w,
+        "min_dimension": min_dim,
+        "sharpness": round(sharpness, 1),
+        "entropy": round(entropy, 2),
+        "contrast": round(contrast, 1),
+        "suggested_confidence": suggested_conf,
+        "quality_tier": quality,
+    }
+
+    logger.info("Calidad imagen: %s — nitidez=%.0f, entropía=%.2f, "
+                "contraste=%.0f, dim_min=%d → conf_sugerida=%.0f%%",
+                quality, sharpness, entropy, contrast, min_dim, suggested_conf)
+
+    return result
+
+
 # ─────────────────────────────────────────────
 # Escala de grises
 # ─────────────────────────────────────────────
@@ -303,36 +447,47 @@ convert_to_grayscale = _to_gray
 # ─────────────────────────────────────────────
 def _smart_upscale(gray: np.ndarray) -> np.ndarray:
     """
-    Upscaling agresivo para máxima precisión OCR.
+    Upscaling adaptativo basado en las dimensiones reales de la imagen.
+
+    Estrategia:
+      - Calcula el factor necesario para que la dimensión menor llegue
+        a ``TARGET_MIN_DIMENSION`` (3000 px).
+      - Imágenes diminutas (< 500px) → escala 4x-5x (hace zoom agresivo
+        para que Tesseract pueda reconocer símbolos pequeños).
+      - Imágenes pequeñas (500-1000px) → escala ~3x.
+      - Imágenes normales (1000-2000px) → escala ~2x-3x.
+      - Imágenes grandes (>3000px) → escala 2x mínimo obligatorio.
+      - Imágenes enormes (>20 MP resultado) → limita para no reventar RAM.
 
     Tesseract necesita al menos ~300 DPI. La mayoría de screenshots
-    son ~96 DPI, así que 3x es el mínimo ideal.
-
-    Caracteres finos (comillas, paréntesis, puntos) necesitan
-    resolución alta para ser reconocidos correctamente.
+    son ~96 DPI, así que caracteres finos (comillas, paréntesis, puntos)
+    necesitan resolución alta para ser reconocidos correctamente.
     """
     h, w = gray.shape[:2]
+    min_dim = min(h, w)
 
-    # Para imágenes de menos de 10 megapíxeles: escalar 3x
-    # Para imágenes grandes: 2x
-    # Para imágenes enormes: 1.5x
-    total_px = h * w
-    if total_px > 20_000_000:  # >20 MP
-        scale = 1.5
-    elif total_px > 8_000_000:  # >8 MP
-        scale = 2.0
+    # Factor basado en dimensión mínima → llevar a TARGET_MIN_DIMENSION
+    if min_dim > 0:
+        scale = TARGET_MIN_DIMENSION / min_dim
     else:
         scale = 3.0
 
-    # Nunca superar 4x
-    scale = min(scale, MAX_UPSCALE_FACTOR)
-    # Mínimo 2x siempre
+    # Clamp al rango permitido
     scale = max(scale, MIN_UPSCALE_FACTOR)
+    scale = min(scale, MAX_UPSCALE_FACTOR)
+
+    # Seguridad: no generar imágenes > ~30 MP (evitar OOM y lentitud)
+    result_px = h * w * scale * scale
+    max_result_px = 30_000_000
+    if result_px > max_result_px:
+        safe_scale = math.sqrt(max_result_px / (h * w))
+        scale = max(MIN_UPSCALE_FACTOR, min(scale, safe_scale))
 
     new_h = int(h * scale)
     new_w = int(w * scale)
 
-    logger.info("Upscale: x%.1f (%dx%d → %dx%d)", scale, w, h, new_w, new_h)
+    logger.info("Upscale: x%.1f (%dx%d → %dx%d, min_dim=%d)",
+                scale, w, h, new_w, new_h, min_dim)
 
     return cv2.resize(gray, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
 
@@ -498,7 +653,7 @@ def resize_if_needed(image: np.ndarray, min_height: int = 600, max_height: int =
 # ─────────────────────────────────────────────
 # Auto-detección de PSM óptimo
 # ─────────────────────────────────────────────
-def analyze_optimal_psm(image_path: str) -> List[int]:
+def analyze_optimal_psm(image_path: str, _preloaded: Optional[Dict] = None) -> List[int]:
     """
     Analiza la estructura visual de la imagen para ordenar los PSMs
     de más a menos probable.
@@ -511,12 +666,19 @@ def analyze_optimal_psm(image_path: str) -> List[int]:
 
     Args:
         image_path: Ruta a la imagen.
+        _preloaded: Caché de datos precargados (img, gray).
 
     Returns:
         Lista de PSMs ordenados de mejor a peor.
     """
-    img = smart_load(image_path)
-    gray = _to_gray(img)
+    if _preloaded and "img" in _preloaded:
+        img = _preloaded["img"]
+    else:
+        img = smart_load(image_path)
+    if _preloaded and "gray" in _preloaded:
+        gray = _preloaded["gray"]
+    else:
+        gray = _to_gray(img)
     h, w = gray.shape[:2]
     aspect = h / max(w, 1)
 
@@ -548,13 +710,12 @@ def analyze_optimal_psm(image_path: str) -> List[int]:
     logger.info("Análisis PSM — aspect: %.2f, h_lines: %d, density: %.3f, blocks: %d",
                  aspect, h_lines, text_density, n_blocks)
 
-    # Clasificación basada en características
-    scores = {3: 0, 6: 0, 4: 0}
+    # Clasificación basada en características (solo PSMs 3 y 6)
+    scores = {3: 0, 6: 0}
 
     # Imagen muy alta (exámenes, formularios) → PSM 6 es ideal
     if aspect > 2.0:
         scores[6] += 3
-        scores[4] += 1
     elif aspect > 1.0:
         scores[6] += 2
     else:
