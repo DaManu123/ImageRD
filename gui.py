@@ -171,6 +171,9 @@ class ImageRDApp(ctk.CTk):
         # ── Manejar cierre de ventana ──
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
+        # ── Verificar Tesseract al iniciar ──
+        self.after(500, self._check_tesseract)
+
     # ─────────────────────────────────────────
     # Grid principal
     # ─────────────────────────────────────────
@@ -834,6 +837,85 @@ class ImageRDApp(ctk.CTk):
             self.after(0, self._update_status, message)
         except Exception:
             pass
+
+    def _check_tesseract(self):
+        """
+        Verifica que Tesseract esté disponible al iniciar la GUI.
+
+        Si no se encuentra, ofrece descargarlo automáticamente
+        usando tesseract_manager.
+        """
+        import shutil as _shutil
+
+        # Verificar si está bundled o en el sistema
+        try:
+            from tesseract_manager import is_bundled, get_tesseract_path
+            if is_bundled():
+                return  # Todo bien, está integrado
+        except ImportError:
+            pass
+
+        if _shutil.which("tesseract"):
+            return  # Está en el sistema
+
+        # No se encontró — preguntar al usuario
+        respuesta = messagebox.askyesno(
+            "Tesseract OCR no encontrado",
+            "ImageRD necesita Tesseract OCR para funcionar.\n\n"
+            "¿Deseas descargarlo automáticamente?\n"
+            "(Se guardará dentro del proyecto, ~30-50 MB)\n\n"
+            "Requiere conexión a internet.",
+        )
+
+        if respuesta:
+            self._setup_tesseract_gui()
+        else:
+            self._update_status("⚠ Tesseract no instalado — el procesamiento OCR no funcionará")
+
+    def _setup_tesseract_gui(self):
+        """
+        Descarga e instala Tesseract en segundo plano desde la GUI.
+
+        Muestra progreso en la barra de estado y bloquea el botón
+        de procesar durante la instalación.
+        """
+        self._process_btn.configure(state="disabled", text="⏳  Instalando Tesseract…")
+        self._progress.configure(mode="indeterminate")
+        self._progress.start()
+        self._update_status("Descargando Tesseract OCR...")
+
+        def _worker():
+            try:
+                from tesseract_manager import setup as tess_setup
+                tess_setup(languages=["eng", "spa", "osd"])
+                self.after(0, self._on_tesseract_installed, True, "")
+            except Exception as exc:
+                self.after(0, self._on_tesseract_installed, False, str(exc))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_tesseract_installed(self, success: bool, error: str):
+        """Callback cuando la instalación de Tesseract termina."""
+        self._progress.stop()
+        self._progress.configure(mode="determinate")
+        self._process_btn.configure(state="normal", text="▶  Procesar imagen")
+
+        if success:
+            self._update_status("✓ Tesseract instalado correctamente")
+            messagebox.showinfo(
+                "Instalación completada",
+                "Tesseract OCR se instaló correctamente.\n"
+                "Ya puedes procesar imágenes.",
+            )
+        else:
+            self._update_status(f"✗ Error instalando Tesseract: {error}")
+            messagebox.showerror(
+                "Error de instalación",
+                f"No se pudo instalar Tesseract:\n{error}\n\n"
+                "Puedes instalarlo manualmente:\n"
+                "  sudo pacman -S tesseract  (Arch)\n"
+                "  sudo apt install tesseract-ocr  (Debian/Ubuntu)",
+            )
 
     def _on_close(self):
         """Maneja el cierre de la ventana."""

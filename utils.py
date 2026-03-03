@@ -116,9 +116,32 @@ def validate_output_format(output_format: str) -> str:
 # ─────────────────────────────────────────────
 # Detección de Tesseract OCR
 # ─────────────────────────────────────────────
+def _configure_vendor_environment() -> None:
+    """
+    Configura las variables de entorno para el Tesseract bundled
+    en vendor/tesseract/.
+
+    Establece LD_LIBRARY_PATH y TESSDATA_PREFIX para que
+    pytesseract (subprocess) encuentre las librerías y datos.
+    """
+    try:
+        from tesseract_manager import configure_environment
+        configure_environment()
+    except ImportError:
+        pass
+
+
 def find_tesseract() -> str:
     """
-    Busca la instalación de Tesseract OCR en el sistema.
+    Busca la instalación de Tesseract OCR.
+
+    Orden de búsqueda:
+      1. Instalación local en vendor/tesseract/ (bundled).
+      2. PATH del sistema.
+      3. Rutas comunes del sistema operativo.
+
+    Si se encuentra el Tesseract bundled, configura automáticamente
+    las variables de entorno necesarias (LD_LIBRARY_PATH, TESSDATA_PREFIX).
 
     Returns:
         Ruta al ejecutable de Tesseract.
@@ -126,12 +149,23 @@ def find_tesseract() -> str:
     Raises:
         EnvironmentError: Si Tesseract no se encuentra instalado.
     """
-    # Verificar si está en el PATH
+    # ── 1. Verificar instalación bundled (vendor/tesseract/) ──
+    try:
+        from tesseract_manager import get_tesseract_path, configure_environment
+
+        bundled = get_tesseract_path()
+        if bundled is not None and bundled.exists():
+            configure_environment()
+            return str(bundled)
+    except ImportError:
+        pass
+
+    # ── 2. Verificar si está en el PATH ──
     tesseract_path = shutil.which("tesseract")
     if tesseract_path:
         return tesseract_path
 
-    # Rutas comunes en Windows
+    # ── 3. Rutas comunes en Windows ──
     common_windows_paths = [
         r"C:\Program Files\Tesseract-OCR\tesseract.exe",
         r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
@@ -142,7 +176,7 @@ def find_tesseract() -> str:
         if os.path.isfile(path):
             return path
 
-    # Rutas comunes en macOS / Linux
+    # ── 4. Rutas comunes en macOS / Linux ──
     unix_paths = [
         "/usr/local/bin/tesseract",
         "/usr/bin/tesseract",
@@ -155,10 +189,12 @@ def find_tesseract() -> str:
 
     raise EnvironmentError(
         "Tesseract OCR no encontrado.\n"
-        "Instálalo según tu sistema operativo:\n"
-        "  Windows : https://github.com/UB-Mannheim/tesseract/wiki\n"
-        "  macOS   : brew install tesseract\n"
-        "  Linux   : sudo apt install tesseract-ocr"
+        "Opciones para instalarlo:\n"
+        "  Automático : python tesseract_manager.py setup\n"
+        "  Windows    : https://github.com/UB-Mannheim/tesseract/wiki\n"
+        "  macOS      : brew install tesseract\n"
+        "  Linux      : sudo pacman -S tesseract  (Arch)\n"
+        "               sudo apt install tesseract-ocr  (Debian/Ubuntu)"
     )
 
 

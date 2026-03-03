@@ -66,11 +66,12 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
-    # Argumentos obligatorios
+    # Argumentos obligatorios (excepto con --setup-tesseract o --add-lang)
     parser.add_argument(
         "--image", "-i",
         type=str,
-        required=True,
+        required=False,
+        default=None,
         help="Ruta a la imagen de entrada (JPG, PNG, JPEG, WEBP, TIFF).",
     )
 
@@ -145,6 +146,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--verbose", "-v",
         action="store_true",
         help="Activar modo detallado (debug).",
+    )
+
+    # Setup de Tesseract integrado
+    parser.add_argument(
+        "--setup-tesseract",
+        action="store_true",
+        help="Descargar e instalar Tesseract OCR dentro del proyecto (sin necesidad de instalación global).",
+    )
+
+    # Agregar idiomas para Tesseract
+    parser.add_argument(
+        "--add-lang",
+        type=str,
+        default=None,
+        help="Descargar un idioma adicional para Tesseract (e.g., fra, deu, por).",
     )
 
     # Versión
@@ -307,6 +323,33 @@ def main() -> None:
     if args.verbose:
         import logging
         setup_logger(level=logging.DEBUG)
+
+    # ── Comando: setup de Tesseract ──
+    if args.setup_tesseract:
+        try:
+            from tesseract_manager import setup as tess_setup
+            langs = ["eng", "spa", "osd"]
+            tess_setup(languages=langs, force=False)
+        except Exception as exc:
+            print(f"\n  ✗ Error instalando Tesseract: {exc}")
+            sys.exit(1)
+        return
+
+    # ── Comando: agregar idioma ──
+    if args.add_lang:
+        try:
+            from tesseract_manager import add_language
+            success = add_language(args.add_lang)
+            if not success:
+                sys.exit(1)
+        except Exception as exc:
+            print(f"\n  ✗ Error: {exc}")
+            sys.exit(1)
+        return
+
+    # ── Validar que --image sea proporcionado para el pipeline ──
+    if not args.image:
+        parser.error("Se requiere --image para procesar una imagen. Usa --help para ayuda.")
 
     try:
         run_pipeline(

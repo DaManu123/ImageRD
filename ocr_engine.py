@@ -36,12 +36,48 @@ from utils import find_tesseract, logger, parse_languages
 
 
 # ─── Configurar Tesseract ────────────────────
+_tesseract_ready = False
+
 try:
     _tess = find_tesseract()
     pytesseract.pytesseract.tesseract_cmd = _tess
     logger.info("Tesseract: %s", _tess)
-except EnvironmentError as err:
-    logger.error(str(err))
+    _tesseract_ready = True
+except EnvironmentError:
+    # Tesseract no encontrado — se intentará auto-setup al primer uso
+    logger.warning("Tesseract no encontrado. Se ofrecerá descarga automática al procesar.")
+
+
+def _ensure_tesseract() -> None:
+    """
+    Asegura que Tesseract esté configurado antes de procesar.
+
+    Si Tesseract no fue encontrado al importar el módulo, intenta
+    descargarlo automáticamente usando tesseract_manager.
+    """
+    global _tesseract_ready
+
+    if _tesseract_ready:
+        return
+
+    try:
+        from tesseract_manager import ensure_tesseract as _ensure
+
+        tess_path = _ensure(interactive=True)
+        if tess_path:
+            pytesseract.pytesseract.tesseract_cmd = tess_path
+            logger.info("Tesseract configurado: %s", tess_path)
+            _tesseract_ready = True
+        else:
+            raise EnvironmentError(
+                "Tesseract OCR no disponible.\n"
+                "Ejecuta: python tesseract_manager.py setup"
+            )
+    except ImportError:
+        raise EnvironmentError(
+            "Tesseract OCR no encontrado y tesseract_manager no disponible.\n"
+            "Instala Tesseract manualmente o ejecuta: python tesseract_manager.py setup"
+        )
 
 
 # ─── Data classes ─────────────────────────────
@@ -138,6 +174,8 @@ class OCREngine:
         En modo multi-paso, prueba ~18 combinaciones (6 variantes × 3 PSMs)
         y elige la que captura más texto con confianza aceptable.
         """
+        # Asegurar que Tesseract esté disponible
+        _ensure_tesseract()
         logger.info("═" * 50)
         logger.info("OCR v3 — Multi-paso: %s | Workers: %d",
                      "SÍ" if self.multi_pass else "NO", self.workers)
