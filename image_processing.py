@@ -1,9 +1,16 @@
 """
 image_processing.py — Preprocesamiento optimizado para Tesseract LSTM (v3).
 
+Preprocesamiento optimizado para Tesseract LSTM (v4).
+
 Principio clave: el motor LSTM de Tesseract (OEM 3) funciona MEJOR
 con imágenes en escala de grises de alta resolución que con imágenes
 binarizadas. La binarización destruye información que el LSTM necesita.
+
+EXCEPCIÓN: capturas de exámenes web con radio buttons (○) se
+benefician de binarización selectiva porque el texto es negro puro
+sobre fondo blanco y los radio buttons son círculos geométricos
+que necesitan bordes limpios para no confundirse con "O", "0", etc.
 
 Pipeline optimizado:
   1. Carga inteligente (OpenCV + Pillow fallback)
@@ -14,6 +21,7 @@ Pipeline optimizado:
   6. Sharpening para definir bordes de caracteres
   7. Padding blanco en bordes
   8. SIN binarización para modo LSTM (variantes opcionales)
+  9. Variantes de examen: binarización + morfología para radio buttons
 """
 
 import math
@@ -152,8 +160,46 @@ def generate_preprocessing_variants(image_path: str) -> List[np.ndarray]:
         )
         variants.append(_add_padding(v6))
 
+    else:
+        # ── Variantes especiales para screenshots de exámenes ──
+        # Los screenshots con radio buttons (○) se benefician de
+        # binarización porque el texto es negro/blanco puro.
+        # El gaussian blur elimina artefactos de compresión JPEG/PNG
+        # que Tesseract interpreta como caracteres basura.
+        logger.info("Screenshot: añadiendo variantes optimizadas para exámenes...")
+
+        # V5: Gaussian blur + Otsu — limpia artefactos de compresión
+        # antes de binarizar. El blur 3x3 suaviza el ruido de JPEG
+        # sin perder los bordes del texto.
+        v5 = cv2.GaussianBlur(up.copy(), (3, 3), 0)
+        _, v5 = cv2.threshold(v5, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        variants.append(_add_padding(v5))
+
+        # V6: Threshold adaptativo — maneja screenshots con fondos
+        # degradados o secciones sombreadas (ej: preguntas resaltadas
+        # en amarillo/gris en exámenes web).
+        v6 = cv2.GaussianBlur(up.copy(), (3, 3), 0)
+        v6 = cv2.adaptiveThreshold(
+            v6, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY, 31, 8,
+        )
+        variants.append(_add_padding(v6))
+
+        # V7: Morfología - cleanup para radio buttons
+        # La operación CLOSE (dilate → erode) cierra pequeños gaps
+        # en los círculos de radio buttons que causan que Tesseract
+        # los confunda con "O", "0", paréntesis, etc.
+        # La operación OPEN (erode → dilate) elimina ruido fino.
+        v7 = cv2.GaussianBlur(up.copy(), (3, 3), 0)
+        _, v7 = cv2.threshold(v7, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
+        v7 = cv2.morphologyEx(v7, cv2.MORPH_CLOSE, kernel_close)
+        kernel_open = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+        v7 = cv2.morphologyEx(v7, cv2.MORPH_OPEN, kernel_open)
+        variants.append(_add_padding(v7))
+
     logger.info("Variantes: %d (%s)", len(variants),
-                "screenshot-opt" if is_ss else "foto-opt")
+                "screenshot-exam-opt" if is_ss else "foto-opt")
     return variants
 
 

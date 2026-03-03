@@ -1,5 +1,4 @@
-"""
-ocr_engine.py — Motor OCR de alta precisión (v3).
+"""ocr_engine.py - Motor OCR de alta precision (v4).
 
 Estrategia multi-paso optimizada:
   - Genera múltiples variantes de preprocesamiento
@@ -7,6 +6,8 @@ Estrategia multi-paso optimizada:
   - Selecciona el resultado que maximiza CANTIDAD de palabras
     con confianza aceptable (no solo confianza alta)
   - Post-procesa texto: corrige comillas, caracteres confundidos
+  - Normaliza radio buttons (○) y checkboxes (☐) de formularios web
+  - Limpia artefactos de OCR con regex especializados para exámenes
   - Fuerza DPI 300 en todas las llamadas a Tesseract
 """
 
@@ -358,7 +359,14 @@ class OCREngine:
 
     # ─── Parsing ──────────────────────────────
     def _parse_words(self, data: Dict) -> List[WordData]:
-        """Filtra palabras por confianza y limpia basura."""
+        """Filtra palabras por confianza y limpia basura.
+
+        Incluye detección de radio buttons por geometría:
+        palabras cuyo bounding box es aproximadamente cuadrado
+        (width ≈ height) y cuyo texto es "O", "0", "o", "()"
+        se marcan internamente como candidatas a radio button
+        para el post-procesamiento posterior.
+        """
         words: List[WordData] = []
         n = len(data["text"])
 
@@ -370,19 +378,31 @@ class OCREngine:
                 continue
 
             # Filtrar solo basura inequívoca (mínimo posible)
-            if len(text) == 1 and text in "|~`^":
+            if len(text) == 1 and text in "|~`^\x00":
                 continue
 
-            # Preservar símbolos de formulario que Tesseract detecta
-            # (círculos, checks, bullets, etc.)
-            if text in ("O", "o", "0", "Oo", "oO"):
-                # Podría ser radio button — preservar
-                pass
+            # ── Detección de radio buttons por geometría ──
+            # Los radio buttons en exámenes web son círculos
+            # pequeños, así que su bounding box es casi cuadrado
+            # y Tesseract los lee como "O", "0", "o", "()", "Oo"
+            w_px = int(data["width"][i])
+            h_px = int(data["height"][i])
+            is_square = (0.7 <= w_px / max(h_px, 1) <= 1.4) if h_px > 0 else False
+            is_small_circle_text = text in (
+                "O", "o", "0", "Oo", "oO", "OO", "oo",
+                "()", "()", "[]", "C", "Q", "G",
+                "©", "®", "™", "¢",  # símbolos confundidos con círculos
+            )
+
+            if is_square and is_small_circle_text and w_px < 60:
+                # Reemplazar directamente por marcador de radio button
+                # que el post-procesamiento reconocerá
+                text = "\u25cb"  # ○
 
             words.append(WordData(
                 text=text, confidence=conf,
                 x=int(data["left"][i]), y=int(data["top"][i]),
-                width=int(data["width"][i]), height=int(data["height"][i]),
+                width=w_px, height=h_px,
                 block_num=int(data["block_num"][i]),
                 par_num=int(data["par_num"][i]),
                 line_num=int(data["line_num"][i]),
@@ -511,6 +531,19 @@ _CHAR_FIXES = {
     "\u00a0": " ",                                    # NBSP
 }
 
+# ─── Símbolos de formulario web ───────────────
+# Caracteres que Tesseract confunde cuando intenta leer
+# los radio buttons (círculos vacíos) de formularios web.
+# Estos se normalizan al símbolo estándar ○ (U+25CB)
+_RADIO_BUTTON_SYMBOL = "○"  # WHITE CIRCLE U+25CB
+_CHECKBOX_UNCHECKED = "☐"   # BALLOT BOX U+2610
+_CHECKBOX_CHECKED = "☑"     # BALLOT BOX WITH CHECK U+2611
+
+# Patrones que Tesseract genera al leer radio buttons
+_RADIO_CONFUSIONS = {
+    "©", "®", "™", "¢", "Ø", "ø",  # símbolos confundidos con círculos
+}
+
 
 def _fix_ocr_text(text: str) -> str:
     """
@@ -520,6 +553,8 @@ def _fix_ocr_text(text: str) -> str:
       - Espacios no rompibles → espacios normales
       - Caracteres confundidos en contexto de código
       - Espaciado alrededor de guiones bajos
+      - Normalización de radio buttons y checkboxes
+      - Limpieza de artefactos de compresión de imagen
     """
     import re
 
@@ -536,7 +571,54 @@ def _fix_ocr_text(text: str) -> str:
     # 3. Separar palabras pegadas a guiones bajos: ________esun → ________ es un
     text = re.sub(r'(_+)([a-záéíóúA-ZÁÉÍÓÚ])', r'\1 \2', text)
 
-    # 4. Colapsar espacios múltiples internos (>3) a uno solo
+    # 4. ─── Normalización de radio buttons ───
+    # "O" aislada al inicio de línea seguida de texto → ○
+    # Esto captura cuando Tesseract lee el círculo del radio button
+    # como una "O" mayúscula, un "0" (cero), o "o" minúscula.
+    text = re.sub(
+        r'^([Oo0])\s+(?=[A-ZÁÉÍÓÚ\w])',
+        f'{_RADIO_BUTTON_SYMBOL} ',
+        text,
+        flags=re.MULTILINE,
+    )
+
+    # Símbolos confundidos al inicio de línea → ○
+    for sym in _RADIO_CONFUSIONS:
+        text = re.sub(
+            rf'^{re.escape(sym)}\s+',
+            f'{_RADIO_BUTTON_SYMBOL} ',
+            text,
+            flags=re.MULTILINE,
+        )
+
+    # "()" o "[]" vacíos al inicio de línea → ○ (checkboxes/radios)
+    text = re.sub(
+        r'^\(\)\s*',
+        f'{_RADIO_BUTTON_SYMBOL} ',
+        text,
+        flags=re.MULTILINE,
+    )
+    text = re.sub(
+        r'^\[\]\s*',
+        f'{_CHECKBOX_UNCHECKED} ',
+        text,
+        flags=re.MULTILINE,
+    )
+
+    # 5. ─── Normalización de checkboxes ───
+    # "[x]" o "[X]" o "[v]" → ☑
+    text = re.sub(
+        r'\[[xXvV✓✔]\]\s*',
+        f'{_CHECKBOX_CHECKED} ',
+        text,
+    )
+
+    # 6. ─── Limpieza de artefactos de compresión ───
+    # Caracteres sueltos que son ruido de compresión JPEG
+    # (aparecen como puntos, guiones, tildes aislados entre palabras)
+    text = re.sub(r'\s[¢©®™]\s', ' ', text)
+
+    # 7. Colapsar espacios múltiples internos (>3) a uno solo
     #    pero preservar indentación al inicio de línea
     lines = text.split('\n')
     fixed_lines = []
@@ -545,8 +627,7 @@ def _fix_ocr_text(text: str) -> str:
         stripped = line.lstrip(' ')
         indent = len(line) - len(stripped)
         # En el contenido, colapsar 3+ espacios a 1
-        import re as _re
-        stripped = _re.sub(r' {3,}', ' ', stripped)
+        stripped = re.sub(r' {3,}', ' ', stripped)
         fixed_lines.append(' ' * indent + stripped)
     text = '\n'.join(fixed_lines)
 
@@ -563,6 +644,8 @@ def _post_process_document(text: str) -> str:
       - Limpia espaciado y formato.
       - Corrige confusiones I/l (Ist→lst, etc.).
       - Corrige confusiones comunes de OCR en español.
+      - Detecta múltiples formatos de enumeración de preguntas.
+      - Normaliza radio buttons y checkboxes.
 
     Args:
         text: Texto completo del documento reconstruido.
@@ -575,15 +658,46 @@ def _post_process_document(text: str) -> str:
     lines = text.split('\n')
 
     # ── Detectar si es un examen/cuestionario ──
+    # Patrones de detección de preguntas ampliados:
+    #   - "Pregunta N" / "Pregunta N:" / "Pregunta N."
+    #   - "N." / "N)" / "N.-" al inicio de línea (numeración)
+    #   - "Q1:" / "Q1." (formato inglés)
+    #   - Líneas con ○ o radio buttons (opciones de respuesta)
     question_indices = []
-    for i, line in enumerate(lines):
-        if re.match(r'^\s*Pregunta\s+\d+', line.strip(), re.IGNORECASE):
-            question_indices.append(i)
+    radio_count = 0
 
-    is_exam = len(question_indices) >= 2
+    _QUESTION_HEAD_RE = re.compile(
+        r'^\s*('
+        r'Pregunta\s+\d+'
+        r'|\d{1,3}[\.\)\-]\s+[A-ZÁÉÍÓÚÑ¿¡]'
+        r'|Q\d{1,3}[\.:\)]\s'
+        r')',
+        re.IGNORECASE,
+    )
+
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if _QUESTION_HEAD_RE.match(stripped):
+            question_indices.append(i)
+        # Contar líneas que parecen opciones de respuesta
+        if re.match(r'^\s*[○☐☑]\s', stripped):
+            radio_count += 1
+        elif re.match(r'^\s*[a-dA-D][\)\.]\s', stripped):
+            radio_count += 1
+
+    # Considerar examen si hay ≥2 preguntas detectadas,
+    # O si hay muchas opciones tipo radio/checkbox (≥4)
+    is_exam = len(question_indices) >= 2 or radio_count >= 4
 
     if not is_exam:
         # No es examen — solo correcciones globales
+        text = _apply_global_fixes(text)
+        return text
+
+    # Si no se detectaron headers pero sí opciones radio,
+    # hacer correcciones globales sin reestructurar el layout
+    if not question_indices:
+        text = _normalize_option_lines(text)
         text = _apply_global_fixes(text)
         return text
 
@@ -639,6 +753,48 @@ def _post_process_document(text: str) -> str:
     text = re.sub(r'\n{4,}', '\n\n\n', text)
 
     return text
+
+
+def _normalize_option_lines(text: str) -> str:
+    """
+    Normaliza líneas de opciones de respuesta cuando no se
+    detectaron preguntas explícitas (formato libre o parcial).
+
+    Busca líneas que parecen opciones y les agrega ○ si falta.
+
+    Args:
+        text: Texto completo del documento.
+
+    Returns:
+        Texto con opciones normalizadas.
+    """
+    import re
+    lines = text.split('\n')
+    result = []
+
+    for line in lines:
+        stripped = line.strip()
+
+        # Ya tiene radio button → preservar
+        if re.match(r'^[○☐☑]\s', stripped):
+            result.append(line)
+            continue
+
+        # Patrón a)/b)/c)/d) → agregar ○
+        m = re.match(r'^[a-dA-D][\)\.]\s+(.+)', stripped)
+        if m:
+            result.append(f'○ {m.group(1)}')
+            continue
+
+        # Patrón "O texto" / "0 texto" al inicio que parece opción
+        m = re.match(r'^[Oo0]\s+([A-ZÁÉÍÓÚ].{5,})', stripped)
+        if m:
+            result.append(f'○ {m.group(1)}')
+            continue
+
+        result.append(line)
+
+    return '\n'.join(result)
 
 
 def _parse_exam_questions(lines: list, question_indices: list) -> list:
@@ -807,22 +963,47 @@ def _is_code_line(stripped: str) -> bool:
     """
     Determina si una línea es código de programación.
 
+    Detecta patrones de Python, JavaScript, Java, C/C++ y otros
+    lenguajes comunes en exámenes de programación.
+
     Args:
         stripped: Línea sin espacios al inicio/final.
 
     Returns:
-        True si parece código Python.
+        True si parece código fuente.
     """
     import re
 
     # Patrones inequívocos de código
     code_patterns = [
+        # Python keywords
         r'^(if|elif|else|for|while|def|class|return|import|from|try|except|finally|with)\b',
         r'^[a-z_]\w*\s*=\s*',                           # asignación: var = ...
         r'^\w+\(.*\)',                                    # llamada: func(...)
         r'print\s*\(',                                    # print(
         r'input\s*\(',                                    # input(
         r'=\s*input\s*\(',                                # = input(
+        r'^\s*#\s*\w',                                    # comentario Python: # algo
+        r'\brange\s*\(',                                  # range(
+        r'\blen\s*\(',                                    # len(
+        r'\bint\s*\(',                                    # int(
+        r'\bstr\s*\(',                                    # str(
+        r'\bfloat\s*\(',                                  # float(
+        r'\blist\s*\(',                                   # list(
+        r'\bdict\s*\(',                                   # dict(
+        r'\b(True|False|None)\b',                         # constantes Python
+        r'^\s*\w+\s*\[.*\]\s*=',                         # indexación: arr[i] = ...
+        # Patrones genéricos de programación
+        r'\{\s*$',                                        # apertura de bloque {
+        r'^\s*\}',                                        # cierre de bloque }
+        r';\s*$',                                         # terminador de sentencia ;
+        r'^\s*(var|let|const|int|float|double|string|char|void|public|private|static)\s',
+        r'System\.out',                                   # Java
+        r'Console\.(Write|Read)',                          # C#
+        r'cout\s*<<',                                     # C++
+        r'cin\s*>>',                                      # C++
+        r'printf\s*\(',                                   # C
+        r'scanf\s*\(',                                    # C
     ]
 
     for pat in code_patterns:
@@ -830,26 +1011,61 @@ def _is_code_line(stripped: str) -> bool:
             return True
 
     # Contiene operadores de programación
-    code_operators = ['==', '>=', '<=', '!=', '= input(', 'print(']
+    code_operators = ['==', '>=', '<=', '!=', '= input(', 'print(',
+                      '+=', '-=', '*=', '/=', '%=', '=>', '->']
     return any(op in stripped for op in code_operators)
 
 
 
 def _clean_option_text(text: str) -> str:
-    """Limpia prefijos residuales del OCR en opciones de respuesta."""
+    """
+    Limpia prefijos residuales del OCR en opciones de respuesta.
+
+    Elimina marcadores de radio button, letras de opción, y
+    artefactos que Tesseract introduce al leer formularios web.
+
+    Args:
+        text: Texto de una opción individual.
+
+    Returns:
+        Texto limpio de la opción.
+    """
     import re
-    # Quitar "O " o "o " al inicio si es residuo de ○ detectado como letra
+
+    # Quitar ○/☐/☑ ya existente si se duplicaría
+    text = re.sub(r'^[○☐☑]\s*', '', text)
+
+    # Quitar "O "/"o "/"0 " al inicio si es residuo del radio button
     text = re.sub(r'^[Oo0]\s+(?=[A-ZÁÉÍÓÚ])', '', text)
-    text = re.sub(r'^[Oo0]\)\s*', '', text)
-    text = re.sub(r'^[a-dA-D]\)\s*', '', text)
-    # Quitar ○ ya existente si se duplicaría
-    text = re.sub(r'^○\s*', '', text)
+
+    # Quitar letras como opción: a) b) c) d) A) B) C) D)
+    text = re.sub(r'^[a-dA-D][\)\.]\s*', '', text)
+    # Quitar O) o 0) que son confusiones de radio + paréntesis
+    text = re.sub(r'^[Oo0][\)\.]\s*', '', text)
+
+    # Quitar símbolos confundidos con radio buttons al inicio
+    text = re.sub(r'^[©®™¢Øø]\s*', '', text)
+
+    # Quitar "()" o "[]" residuales al inicio
+    text = re.sub(r'^\(\)\s*', '', text)
+    text = re.sub(r'^\[\]\s*', '', text)
+
+    # Quitar guion aislado al inicio (a veces OCR lee "— opción")
+    text = re.sub(r'^[\-–—]\s+', '', text)
+
     return text.strip()
 
 
 def _apply_global_fixes(text: str) -> str:
     """
     Correcciones globales de OCR que aplican a todo el documento.
+
+    Incluye:
+      - Confusiones I/l comunes en OCR (Ist→lst)
+      - Fusión de palabras comunes en español
+      - Confusiones de letras/números frecuentes
+      - Limpieza de artefactos repetitivos
+      - Correcciones de acentos mal reconocidos
 
     Args:
         text: Texto completo.
@@ -859,24 +1075,67 @@ def _apply_global_fixes(text: str) -> str:
     """
     import re
 
-    # Ist → lst (confusión I/l muy común en OCR)
+    # ── Confusión I/l (muy común en OCR) ──
     text = re.sub(r'\bIst\b', 'lst', text)
     text = re.sub(r'\bIst\(', 'lst(', text)
     text = re.sub(r'\bIst\[', 'lst[', text)
+    text = re.sub(r'\bIen\b', 'len', text)
+    text = re.sub(r'\bIen\(', 'len(', text)
 
-    # iflint → if(int  (confusión l/( y fusión de palabras)
+    # ── Fusión de palabras y confusiones l/(/{ ──
     text = re.sub(r'\biflint\b', 'if(int', text)
     text = re.sub(r'\bifllint\b', 'if(int', text)
+    text = re.sub(r'\bprinl\b', 'print', text)
+    text = re.sub(r'\bprintt\b', 'print', text)
+    text = re.sub(r'\binpul\b', 'input', text)
 
-    # M/P) → M/F) cuando aparece en contexto de Genero
+    # ── M/P → M/F (contexto género) ──
     text = re.sub(r'Genero\s*\(M/P\)', 'Genero (M/F)', text)
     text = re.sub(r'\(M/P\)', '(M/F)', text)
 
-    # Corregir "esun" → "es un" (palabras pegadas comunes)
+    # ── Palabras pegadas frecuentes en español ──
     text = re.sub(r'\besun\b', 'es un', text)
+    text = re.sub(r'\besuna\b', 'es una', text)
+    text = re.sub(r'\bnoexiste\b', 'no existe', text)
+    text = re.sub(r'\bnoes\b', 'no es', text)
+    text = re.sub(r'\bdela\b(?!nte)', 'de la', text)  # dela pero no delante
+    text = re.sub(r'\bdelos\b', 'de los', text)
+    text = re.sub(r'\bporque(?:es)\b', 'porque es', text)
+    text = re.sub(r'\bque es\b', 'que es', text)  # ya correcto, preservar
 
-    # Corregir "diferencía" → "diferencia" (tilde incorrecta)
+    # ── Acentos mal reconocidos ──
     text = re.sub(r'\bdiferencía\b', 'diferencia', text)
+    text = re.sub(r'\bfuncíón\b', 'función', text)
+    text = re.sub(r'\boperacíón\b', 'operación', text)
+    text = re.sub(r'\bcondícíón\b', 'condición', text)
+    text = re.sub(r'\bvaríable\b', 'variable', text)
+
+    # ── Confusiones número/letra comunes ──
+    # "l" (L minúscula) como "1" en contexto de código
+    text = re.sub(r'(?<=\d)l(?=\d)', '1', text)  # 1l0 → 110
+    text = re.sub(r'(?<=\d)O(?=\d)', '0', text)  # 1O0 → 100
+
+    # ── Artefactos repetitivos de OCR ──
+    # Secuencias de puntos/guiones excesivos (>10) → limpiar
+    text = re.sub(r'\.{10,}', '...', text)
+    text = re.sub(r'\-{10,}', '─' * 10, text)
+    text = re.sub(r'_{10,}', '_' * 10, text)
+
+    # ── Limpieza de líneas que son puro ruido ──
+    # Líneas con solo 1-2 caracteres de ruido (no letras/dígitos)
+    lines = text.split('\n')
+    cleaned = []
+    for line in lines:
+        stripped = line.strip()
+        # Preservar líneas vacías y líneas con contenido real
+        if not stripped or len(stripped) > 2:
+            cleaned.append(line)
+            continue
+        # Líneas de 1-2 chars: mantener solo si son alfanuméricas
+        if re.match(r'^[a-zA-Z0-9áéíóúñÁÉÍÓÚÑ]+$', stripped):
+            cleaned.append(line)
+        # Else: descartar líneas de 1-2 chars con solo símbolos (ruido)
+    text = '\n'.join(cleaned)
 
     return text
 
